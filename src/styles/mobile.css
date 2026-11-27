@@ -1,0 +1,314 @@
+/* ------------------------------------------------------------------ */
+/*  Mobile responsiveness (2026-11-26)                                 */
+/*  Loaded last on every page. Same look as desktop; this only fixes   */
+/*  layout, sizing and tap targets on phones (320–760px, and landscape */
+/*  phones). Nothing here changes colours, type or the neobrutalist    */
+/*  style.                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Never scroll sideways. `clip` (not hidden) keeps sticky elements working. */
+html,
+body {
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+/* Grid and flex children refuse to shrink below their content by default, which is what pushed
+   the docs page 1000px wide on a phone. Let them shrink. */
+.docs__layout > *,
+.docs__content > *,
+.docs__card,
+.docs__body,
+.home__copy,
+.home__hero > *,
+.play__hero > *,
+.dash__shell > *,
+.arena > *,
+.room--split > *,
+.hub > *,
+.lobbies__card,
+.review,
+.career {
+  min-width: 0;
+}
+
+img,
+svg,
+canvas,
+video {
+  max-width: 100%;
+}
+
+/* Wide tables (game review) scroll inside their own box instead of widening the page. */
+.review__ledger,
+.review__calls,
+.review__rounds {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* The ticker band keeps clear of the home-indicator bar on notched phones. */
+.home__ticker {
+  height: calc(56px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* ---------- tablets and large phones ---------- */
+
+@media (max-width: 900px) {
+  .docs__layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .docs__toc {
+    max-width: 100%;
+  }
+
+  /* the chip row scrolls on its own; fade nothing, just keep the scrollbar out of the way */
+  .docs__toc ol {
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .docs__toc ol::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* ---------- phones ---------- */
+
+@media (max-width: 760px) {
+  /* 16px inputs: anything smaller makes iOS Safari zoom the page when a field is focused */
+  input,
+  select,
+  textarea,
+  .lobbies__input,
+  .field__input {
+    font-size: 16px;
+  }
+
+  /* "?" and "play": a side-by-side pair in the corner, with room reserved above the content
+     so they never sit on top of the medallion */
+  .page__help {
+    top: 12px;
+    right: 12px;
+    width: 44px;
+    height: 44px;
+    font-size: 1.2rem;
+  }
+
+  .page__dash {
+    top: 12px;
+    right: 68px;
+    min-height: 44px;
+    padding: 0 12px;
+  }
+
+  .page.home,
+  main.page {
+    padding-top: 4.75rem;
+  }
+
+  .home__art {
+    width: min(300px, 74vw);
+  }
+
+  .home__steps {
+    margin-top: var(--space-8);
+  }
+
+  /* cookie banner: full width, thumb-sized buttons */
+  .cookie {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-width: none;
+  }
+
+  /* docs */
+  .docs__top {
+    gap: var(--space-3);
+  }
+
+  .docs__card {
+    box-shadow: 6px 6px 0 var(--color-ink);
+  }
+
+  .docs__head {
+    padding: var(--space-3) var(--space-4);
+    gap: var(--space-3);
+  }
+
+  .docs__num {
+    width: 40px;
+    height: 40px;
+    font-size: 1.4rem;
+  }
+
+  .docs__head h2 {
+    font-size: clamp(1.6rem, 7vw, 2.2rem);
+  }
+
+  .docs__signoff-link {
+    word-break: break-all;
+  }
+
+  /* play: app bar wraps cleanly, wallet menu fits the screen */
+  .play {
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
+  }
+
+  .play .dash__topbar {
+    gap: var(--space-3);
+  }
+
+  .play .dash__nav {
+    flex: 1 1 auto;
+  }
+
+  .play .dash__navbtn {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .wallet-chip__menu {
+    min-width: 0;
+    width: min(320px, calc(100vw - 2rem));
+  }
+
+  .play .lobbies__list {
+    grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
+  }
+
+  .name-modal__panel {
+    padding: var(--space-6) var(--space-4);
+  }
+
+  .name-modal__actions {
+    flex-direction: column-reverse;
+  }
+
+  .name-modal__actions .btn {
+    width: 100%;
+  }
+
+  .toasts {
+    max-width: calc(100vw - 24px);
+  }
+
+  .toast {
+    text-align: center;
+  }
+
+  .room__invite-actions {
+    flex-direction: column;
+  }
+
+  .room__invite-btn {
+    width: 100%;
+  }
+
+  .room__actions .btn {
+    width: 100%;
+  }
+
+  /* any button or link used as a control stays a comfortable thumb target */
+  .btn,
+  .dash__navbtn,
+  .docs__chip,
+  .lobbies__join,
+  .hub__btn {
+    min-height: 48px;
+  }
+}
+
+/* ---------- small phones (iPhone SE, 320–380px) ---------- */
+
+@media (max-width: 380px) {
+  /* top bar: the logo chip keeps just the mascot so both chips fit on one row */
+  .docs__chip--brand span {
+    display: none;
+  }
+
+  .docs__chip {
+    white-space: nowrap;
+  }
+
+  .home__badge {
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    padding: 6px 12px;
+    text-align: center;
+  }
+
+  .page__spark,
+  .play__spark,
+  .docs__spark {
+    display: none;
+  }
+
+  .home__headline,
+  .page.home .home__headline {
+    font-size: clamp(2.6rem, 13vw, 3.2rem);
+  }
+
+  .docs__title {
+    font-size: clamp(3rem, 15vw, 3.6rem);
+  }
+
+  .play .play__title {
+    font-size: clamp(2.4rem, 12.5vw, 3rem);
+  }
+
+  .home__step,
+  .signin__step {
+    padding: var(--space-5) var(--space-4) var(--space-4);
+  }
+
+  .docs__body,
+  .hub__body {
+    padding: var(--space-4);
+  }
+
+  .arena__stat {
+    padding-inline: var(--space-2);
+  }
+
+  .arena .game__choice-label {
+    font-size: 1.6rem;
+  }
+}
+
+/* ---------- landscape phones: very little height ---------- */
+
+@media (max-height: 520px) and (orientation: landscape) {
+  .page.home,
+  main.page {
+    padding-top: 4rem;
+  }
+
+  .home__hero {
+    gap: var(--space-6);
+  }
+
+  .home__art {
+    width: min(240px, 32vw);
+  }
+
+  .play__hero {
+    margin-bottom: var(--space-4);
+  }
+
+  .play .play__title {
+    font-size: 2.6rem;
+  }
+
+  .dash__stack,
+  .room,
+  .signin {
+    padding: var(--space-4);
+  }
+}
