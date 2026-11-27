@@ -21,13 +21,6 @@ import {
   type Address,
   type Hex,
 } from 'viem';
-import {
-  actualSeed,
-  generateProof,
-  keyHashOf,
-  proofToAbi,
-  publicKeyOf,
-} from '../../backend/src/chain/vrfProof.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -45,11 +38,11 @@ const CHAIN = defineChain({
 
 const ERROR_STRING_ABI = [{ type: 'error', name: 'Error', inputs: [{ type: 'string', name: 'message' }] }] as const;
 
-export const ORACLE_SK = 0x5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1edn;
-export const ORACLE_PK = publicKeyOf(ORACLE_SK);
-export const KEY_HASH = keyHashOf(ORACLE_PK);
+/** Arc VRF testnet key hash (any bytes32 works against the mock). */
+export const KEY_HASH: Hex = '0xcf39e27191d1d13c8fec1a175eda831392ef974fe21a5a0a0680c3a22c6deb88';
+export const SUB_ID = 4242n;
 
-export async function setup(opts: { callbackGasLimit?: number } = {}) {
+export async function setup() {
   const provider = ganache.provider({
     logging: { quiet: true },
     wallet: { mnemonic: MNEMONIC, totalAccounts: 4 },
@@ -93,13 +86,12 @@ export async function setup(opts: { callbackGasLimit?: number } = {}) {
     return r.contractAddress!;
   }
 
-  const store = await deploy('BlockhashStore');
-  const coordinator = await deploy('AkipolyVRFCoordinator', [store]);
-  const rounds = await deploy('AkipolyRounds', [coordinator, treasury, KEY_HASH, 1, opts.callbackGasLimit ?? 200_000]);
+  // The hosted Arc VRF coordinator is replaced by a recording mock in tests.
+  const coordinator = await deploy('MockArcVRFCoordinator');
+  const rounds = await deploy('AkipolyRounds', [coordinator, treasury, KEY_HASH, SUB_ID, 0, 150_000]);
 
-  const coordAbi = artifact('AkipolyVRFCoordinator').abi;
+  const coordAbi = artifact('MockArcVRFCoordinator').abi;
   const roundsAbi = artifact('AkipolyRounds').abi;
-  const storeAbi = artifact('BlockhashStore').abi;
 
   async function send(from: Address, address: Address, abi: Abi, functionName: string, args: unknown[] = []) {
     // Simulate first so reverts surface as decoded errors.
@@ -112,40 +104,18 @@ export async function setup(opts: { callbackGasLimit?: number } = {}) {
     return receipt;
   }
 
-  await send(owner!, coordinator, coordAbi, 'registerProvingKey', [ORACLE_PK]);
-  await send(owner!, coordinator, coordAbi, 'addConsumer', [rounds]);
-
-  /** Treasury requests a ball. Returns what the oracle reads from the log. */
+  /** Treasury requests a ball. Returns the requestId from AkipolyRounds' BallRequested. */
   async function requestBall(gameId: Hex, round: number, from: Address = treasury!) {
     const receipt = await send(from, rounds, roundsAbi, 'requestBall', [gameId, round]);
-    const [ev] = parseEventLogs({ abi: coordAbi, logs: receipt.logs, eventName: 'RandomWordsRequested' }) as unknown as {
-      args: { requestId: bigint; preSeed: bigint; callbackGasLimit: number; numWords: number; sender: Address };
+    const [ev] = parseEventLogs({ abi: roundsAbi, logs: receipt.logs, eventName: 'BallRequested' }) as unknown as {
+      args: { requestId: bigint };
     }[];
-    return {
-      receipt,
-      requestId: ev!.args.requestId,
-      preSeed: ev!.args.preSeed,
-      rc: {
-        blockNum: receipt.blockNumber,
-        callbackGasLimit: ev!.args.callbackGasLimit,
-        numWords: ev!.args.numWords,
-        sender: ev!.args.sender,
-      },
-    };
+    return { receipt, requestId: ev!.args.requestId };
   }
 
-  /** What the oracle node does: read the block hash, prove, return the call args. */
-  async function prove(req: Awaited<ReturnType<typeof requestBall>>, sk = ORACLE_SK) {
-    // Wait for requestConfirmations (1): blockhash(n) is only readable from block n+1 on.
-    await test.mine({ blocks: 1 });
-    const block = await pub.getBlock({ blockNumber: req.rc.blockNum });
-    const alpha = actualSeed(req.preSeed, block.hash!);
-    const { proof, output } = generateProof(sk, req.preSeed, alpha);
-    return { proof: proofToAbi(proof), output, alpha };
-  }
-
-  async function fulfill(proof: ReturnType<typeof proofToAbi>, rc: Awaited<ReturnType<typeof requestBall>>['rc']) {
-    return send(fulfiller!, coordinator, coordAbi, 'fulfillRandomWords', [proof, rc]);
+  /** What the Arc VRF does once its proof checks out: call back with the word. */
+  async function fulfill(requestId: bigint, word: bigint) {
+    return send(fulfiller!, coordinator, coordAbi, 'fulfill', [requestId, word]);
   }
 
   return {
@@ -153,11 +123,10 @@ export async function setup(opts: { callbackGasLimit?: number } = {}) {
     pub,
     test,
     accounts: { owner: owner!, treasury: treasury!, stranger: stranger!, fulfiller: fulfiller! },
-    addresses: { store, coordinator, rounds },
-    abis: { coordAbi, roundsAbi, storeAbi },
+    addresses: { coordinator, rounds },
+    abis: { coordAbi, roundsAbi },
     send,
     requestBall,
-    prove,
     fulfill,
   };
 }

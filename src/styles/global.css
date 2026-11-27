@@ -2950,6 +2950,7 @@ html.wave-pending .waterwave {
 
 .review__fair--bad { color: #a33a2a; }
 .review__fair--na { color: rgba(23, 23, 23, 0.55); }
+.review__proof { font-size: 0.75rem; font-weight: 700; }
 .review__me { background: rgba(255, 245, 0, 0.35); }
 
 @media (max-width: 620px) {

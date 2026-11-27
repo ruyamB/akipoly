@@ -125,14 +125,15 @@ export async function advanceRound(c: pg.PoolClient, round: RoundRow): Promise<{
  * The VRF didn't deliver a ball before the deadline (oracle down, tx stuck or
  * reverted, job held). Nobody gains from this: the round is void, side bets are
  * refunded and nobody is out, as with any other void round. A missing opening
- * ball ends the game and returns the pot without a house fee. The VRF job is
- * left for operators (if it still lands on-chain, the result is simply unused).
+ * ball ends the game and returns the pot without a house fee. The open VRF job
+ * is held for operators, so it stops being polled (if the answer still lands
+ * on-chain, it is simply unused).
  * Returns true when this ended the game.
  */
 async function voidUndrawnRound(c: pg.PoolClient, round: RoundRow): Promise<boolean> {
   await c.query(
     `update public.vrf_jobs
-        set status = case when status = 'pending' then 'held' else status end,
+        set status = case when status in ('pending', 'requested') then 'held' else status end,
             last_error = coalesce(last_error, 'round voided: no VRF answer before the deadline'),
             updated_at = now()
       where round_id = $1`,

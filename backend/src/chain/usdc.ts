@@ -101,25 +101,6 @@ export async function transferStatus(hash: Hash): Promise<'success' | 'reverted'
   }
 }
 
-const BALANCE_CHUNK = 500;
-
-/**
- * USDC balances (base units) for many wallets, read through Multicall3 in
- * chunks. Same order as `addresses`; a read that fails counts as 0.
- */
-export async function usdcBalances(addresses: Address[]): Promise<bigint[]> {
-  const out: bigint[] = [];
-  for (let i = 0; i < addresses.length; i += BALANCE_CHUNK) {
-    const chunk = addresses.slice(i, i + BALANCE_CHUNK);
-    const results = await publicClient.multicall({
-      allowFailure: true,
-      contracts: chunk.map((a) => ({ address: usdc, abi: erc20Abi, functionName: 'balanceOf', args: [a] }) as const),
-    });
-    for (const r of results) out.push(r.status === 'success' ? (r.result as bigint) : 0n);
-  }
-  return out;
-}
-
 export async function treasuryBalance(): Promise<bigint> {
   return publicClient.readContract({
     address: usdc,

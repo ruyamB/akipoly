@@ -17,7 +17,6 @@
     "check:leaderboard": "tsx scripts/leaderboard-check.ts"
   },
   "dependencies": {
-    "@noble/curves": "^1.9.7",
     "dotenv": "^16.6.1",
     "jose": "^6.2.18",
     "pg": "^8.23.1",

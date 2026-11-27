@@ -1,111 +1,83 @@
 /**
- * Leaderboard: every signed-up wallet ranked by the USDC it holds on Arc.
- * Balances are read on-chain in one multicall pass and cached briefly, so a
- * burst of viewers costs one chain read, not one each.
+ * Leaderboard: players ranked by skill, read from finished games only.
+ * Rank = win rate (wins ÷ finished games), then more wins, then net profit.
+ * Wallet balance plays no part: holding USDC isn't skill.
  */
-import { getAddress, isAddress, type Address } from 'viem';
 import { pool } from '../db/pool.js';
-import { usdcBalances } from '../chain/usdc.js';
-import { AppError } from '../errors.js';
-import { log } from '../log.js';
 import type { LeaderboardEntry, LeaderboardView } from '../shared/protocol.js';
 
-const CACHE_MS = 30_000;
-/**
- * Answer within this long even if the chain read hasn't finished (the client
- * gives up at 60 s). The read keeps going and fills the cache for the retry.
- */
-const REPLY_WITHIN_MS = 20_000;
+/** Finished games needed before a player is ranked; fewer is just luck. */
+export const MIN_GAMES = 3;
 const TOP = 100;
 
-interface Ranked {
-  rank: number;
-  walletAddress: Address;
-  balance: bigint;
+interface Row {
+  user_id: string;
+  name: string | null;
+  wallet_address: string | null;
+  games: number;
+  wins: number;
+  net: string;
+  rank: string | null;
 }
 
-interface Snapshot {
-  rows: Ranked[];
-  byWallet: Map<Address, Ranked>;
-  readAt: number;
-}
+// ponytail: aggregates every finished game per request; add a short cache or a
+// stats table if this query shows up as slow.
+const QUERY = `
+  with played as (
+    select gp.user_id, count(*)::int as games,
+           count(*) filter (where gp.placement = 1)::int as wins,
+           sum(gp.buy_in) as buy_ins
+      from public.game_players gp
+      join public.games g on g.id = gp.game_id and g.status = 'finished'
+     group by gp.user_id
+  ), side as (
+    select pk.user_id, sum(pk.side_bet) as side_bets
+      from public.picks pk
+      join public.rounds r on r.id = pk.round_id
+      join public.games g on g.id = r.game_id and g.status = 'finished'
+     group by pk.user_id
+  ), paid as (
+    select p.user_id, sum(p.amount) as won
+      from public.payouts p
+      join public.games g on g.id = p.game_id and g.status = 'finished'
+     where p.status <> 'failed' and p.reason in ('pot', 'split', 'side_win', 'side_refund')
+     group by p.user_id
+  ), stats as (
+    select pl.user_id, u.display_name as name, u.wallet_address, pl.games, pl.wins,
+           coalesce(pd.won, 0) - pl.buy_ins - coalesce(s.side_bets, 0) as net
+      from played pl
+      join public.app_users u on u.privy_user_id = pl.user_id
+      left join side s on s.user_id = pl.user_id
+      left join paid pd on pd.user_id = pl.user_id
+  ), ranked as (
+    select user_id, rank() over (order by wins::numeric / games desc, wins desc, net desc) as rank
+      from stats where games >= $1
+  )
+  select st.user_id, st.name, st.wallet_address, st.games, st.wins, st.net::text as net, rk.rank::text as rank
+    from stats st
+    left join ranked rk on rk.user_id = st.user_id
+   where rk.rank is not null or st.user_id = $2
+   order by rk.rank nulls last, st.user_id`;
 
-let cached: Snapshot | null = null;
-let inFlight: Promise<Snapshot> | null = null;
-
-async function readSnapshot(): Promise<Snapshot> {
-  const startedAt = Date.now();
-  const res = await pool.query<{ wallet_address: string }>(
-    'select distinct wallet_address from public.app_users where wallet_address is not null',
-  );
-  const wallets = [
-    ...new Set(res.rows.map((r) => r.wallet_address).filter((a) => isAddress(a)).map((a) => getAddress(a))),
-  ];
-  const balances = await usdcBalances(wallets);
-
-  const sorted = wallets
-    .map((walletAddress, i) => ({ walletAddress, balance: balances[i] ?? 0n }))
-    .sort((a, b) =>
-      a.balance === b.balance ? a.walletAddress.localeCompare(b.walletAddress) : a.balance > b.balance ? -1 : 1,
-    );
-
-  const rows: Ranked[] = [];
-  sorted.forEach((r, i) => {
-    const prev = rows[i - 1];
-    rows.push({ ...r, rank: prev && prev.balance === r.balance ? prev.rank : i + 1 });
-  });
-  log.info({ wallets: wallets.length, ms: Date.now() - startedAt }, 'leaderboard balances read');
-  return { rows, byWallet: new Map(rows.map((r) => [r.walletAddress, r])), readAt: Date.now() };
-}
-
-async function snapshot(): Promise<Snapshot> {
-  if (cached && Date.now() - cached.readAt < CACHE_MS) return cached;
-  if (!inFlight) {
-    const startedAt = Date.now();
-    inFlight = readSnapshot()
-      .then((s) => (cached = s))
-      .catch((err: unknown) => {
-        log.warn({ err, ms: Date.now() - startedAt }, 'leaderboard balances read failed');
-        throw err;
-      })
-      .finally(() => {
-        inFlight = null;
-      });
-    // Nobody may be waiting on it (stale cache served, or deadline passed).
-    inFlight.catch(() => undefined);
-  }
-  // A slightly old board beats a spinner: refresh in the background.
-  if (cached) return cached;
-  return withinDeadline(inFlight);
-}
-
-function withinDeadline<T>(work: Promise<T>): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new AppError('INTERNAL', 'balances are still loading from Arc, try again in a moment')),
-      REPLY_WITHIN_MS,
-    );
-  });
-  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
-}
-
-export async function leaderboardFor(viewerWallet: string | null): Promise<LeaderboardView> {
-  const snap = await snapshot();
-  const me = viewerWallet && isAddress(viewerWallet) ? getAddress(viewerWallet) : null;
-  const view = (r: Ranked): LeaderboardEntry => ({
-    rank: r.rank,
-    walletAddress: r.walletAddress,
-    balance: r.balance.toString(),
-    isMe: r.walletAddress === me,
+export async function leaderboardFor(viewerUserId: string): Promise<LeaderboardView> {
+  const { rows } = await pool.query<Row>(QUERY, [MIN_GAMES, viewerUserId]);
+  const view = (r: Row): LeaderboardEntry => ({
+    rank: r.rank === null ? null : Number(r.rank),
+    name: r.name,
+    walletAddress: r.wallet_address,
+    games: r.games,
+    wins: r.wins,
+    net: r.net,
+    isMe: r.user_id === viewerUserId,
   });
 
-  const entries = snap.rows.slice(0, TOP).map(view);
-  const mine = me ? snap.byWallet.get(me) : undefined;
+  const ranked = rows.filter((r) => r.rank !== null);
+  const entries = ranked.slice(0, TOP).map(view);
+  const mine = rows.find((r) => r.user_id === viewerUserId);
   return {
     entries,
     me: mine && !entries.some((e) => e.isMe) ? view(mine) : null,
-    total: snap.rows.length,
-    updatedAt: new Date(snap.readAt).toISOString(),
+    total: ranked.length,
+    minGames: MIN_GAMES,
   };
 }

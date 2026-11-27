@@ -4,8 +4,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
-import { ballFromRandomWord } from '../src/domain/fairness.ts';
-import { expandRandomWords } from '../src/chain/vrfProof.ts';
+import { ballFromRandomWord, gameIdToBytes16 } from '../src/domain/fairness.ts';
+import { encodeAbiParameters, keccak256 } from 'viem';
+
+// Any uint256 works as an Arc VRF word; derive reproducible ones for the tests.
+const expandRandomWords = (seed: bigint, n: number) =>
+  Array.from({ length: n }, (_, i) =>
+    BigInt(keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [seed, BigInt(i)]))),
+  );
 import { verifyLegacyRound, verifyVrfRound, type OnChainDraw } from '../../src/lib/fairness.ts';
 
 const GAME = '0f8fad5b-d9cb-469f-a165-70867728950e';
@@ -52,4 +58,9 @@ test('legacy rounds: commit-reveal check accepts real rounds and rejects tamperi
     assert.equal((await verifyLegacyRound(seed, seedHash, GAME, round, (ball + 1) % 17)).ballOk, false);
     assert.equal((await verifyLegacyRound(`${seed}0`, seedHash, GAME, round, ball)).hashOk, false);
   }
+});
+
+test('game ids map to the bytes16 the contract keys rounds by', () => {
+  assert.equal(gameIdToBytes16('0f8fad5b-d9cb-469f-a165-70867728950e'), '0x0f8fad5bd9cb469fa16570867728950e');
+  assert.throws(() => gameIdToBytes16('game-1'));
 });

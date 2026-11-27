@@ -240,7 +240,7 @@ const toc = [
       <p class="docs__legal">© {year} akipoly. all rights reserved.</p>
 
       <!-- invisible jumpscare link at the left corner -->
-      <a id="jumpscare-link" class="jumpscare-link" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ" target="_blank" rel="noopener noreferrer">□</a>
+      <a id="jumpscare-link" class="jumpscare-link" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ" target="_blank" rel="noopener noreferrer" tabindex="-1" aria-hidden="true">□</a>
     </main>
 
     <div class="home__ticker" aria-hidden="true">
@@ -366,7 +366,11 @@ const toc = [
         z-index: 999998;
         display: none;
         background: #ff0000;
-        animation: flash 0.1s infinite;
+        /* Under 3 flashes/s (WCAG 2.3.1). */
+        animation: flash 0.8s infinite;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #jumpscare-bg, #jumpscare-content { animation: none; }
       }
       #jumpscare-bg.visible {
         display: block;
@@ -392,42 +396,46 @@ const toc = [
       const overlay = document.getElementById('jumpscare-overlay');
       const bg = document.getElementById('jumpscare-bg');
 
-      if (link && overlay && bg) link.addEventListener('click', (e) => {
-        const targetUrl = link.href;
-        e.preventDefault();
+      if (link && overlay && bg) {
+        link.addEventListener('click', (e) => {
+          const targetUrl = link.href;
+          e.preventDefault();
 
-        // Sudden audio blast
-        try {
-          // Older iOS/Safari only ship the prefixed constructor.
-          const AC =
-            window.AudioContext ??
-            (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-          if (!AC) throw new Error('no Web Audio');
-          const ctx = new AC();
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.connect(gain);
-          gain.connect(ctx.destination);
-          osc.type = 'sawtooth';
-          osc.frequency.setValueAtTime(150, ctx.currentTime);
-          osc.frequency.exponentialRampToValueAtTime(800, ctx.currentTime + 0.5);
-          gain.gain.setValueAtTime(0.8, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1);
-          osc.start();
-          osc.stop(ctx.currentTime + 1);
-        } catch { /* audio blocked */ }
+          // Sudden audio blast
+          try {
+            // Older iOS/Safari only ship the prefixed constructor.
+            const AC =
+              window.AudioContext ??
+              (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+            if (!AC) throw new Error('no Web Audio');
+            const ctx = new AC();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(150, ctx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(800, ctx.currentTime + 0.5);
+            gain.gain.setValueAtTime(0.8, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1);
+            osc.onended = () => void ctx.close();
+            osc.start();
+            osc.stop(ctx.currentTime + 1);
+          } catch { /* audio blocked */ }
 
-        // Jumpscare appears instantly
-        bg.classList.add('visible');
-        overlay.classList.add('visible');
+          // Jumpscare appears instantly
+          bg.classList.add('visible');
+          overlay.classList.add('visible');
 
-        // Navigate to the rick roll after the jumpscare
-        setTimeout(() => {
-          window.open(targetUrl, '_blank');
-          overlay.classList.remove('visible');
-          bg.classList.remove('visible');
-        }, 3000);
-      });
+          // Same-tab navigation: a window.open this late is outside Safari's
+          // user-activation window and gets popup-blocked.
+          setTimeout(() => {
+            overlay.classList.remove('visible');
+            bg.classList.remove('visible');
+            window.location.assign(targetUrl);
+          }, 3000);
+        });
+      }
     </script>
   </body>
 </html>

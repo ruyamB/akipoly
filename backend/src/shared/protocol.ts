@@ -101,16 +101,23 @@ export interface RoundVrf {
   /** AkipolyRounds.requestBall, sent by the treasury after betting closed. */
   requestTx: string;
   requestBlock: string;
-  /** AkipolyVRFCoordinator.fulfillRandomWords: the proof, verified on-chain. Null if fulfilled by someone else. */
+  /** The Arc VRF's callback tx that delivered the word (proof verified on-chain). Null if not found. */
   fulfillTx: string | null;
   /** uint256 word the coordinator delivered; ball = randomWord % 17. */
   randomWord: string;
+  /** AkipolyRounds and coordinator that drew it; null for rounds drawn before these were recorded. */
+  rounds: string | null;
+  coordinator: string | null;
 }
 
 /** Where the VRF lives, so clients can verify against the chain themselves. */
 export interface VrfContracts {
+  /** AkipolyRounds, which turns the VRF word into the ball. */
   rounds: string;
+  /** Hosted Arc VRF coordinator that verifies the proof on-chain. */
   coordinator: string;
+  /** Arc VRF explorer; a request's proof page is `${vrfExplorer}/requests/<requestId>`. */
+  vrfExplorer: string | null;
 }
 export type RoundOutcome = 'higher' | 'lower' | 'push' | 'void' | 'opening';
 
@@ -177,24 +184,30 @@ export interface CareerEntry {
   won: string;
 }
 
-/** One wallet on the leaderboard, ranked by its on-chain USDC balance. */
+/** One player on the leaderboard, ranked by win rate over finished games. */
 export interface LeaderboardEntry {
-  /** 1-based; wallets with equal balances share a rank. */
-  rank: number;
-  walletAddress: string;
-  balance: string;
+  /** 1-based; equal stats share a rank. null until the player has `minGames` finished games. */
+  rank: number | null;
+  name: string | null;
+  walletAddress: string | null;
+  /** Finished games played. */
+  games: number;
+  /** Finished games won (placement 1, splits included). */
+  wins: number;
+  /** USDC won minus USDC paid in (buy-ins + side bets), base units; may be negative. */
+  net: string;
   isMe: boolean;
 }
 
 export interface LeaderboardView {
-  /** Top wallets, highest balance first. */
+  /** Top ranked players, best first. */
   entries: LeaderboardEntry[];
-  /** The viewer's own row when it falls outside `entries`. */
+  /** The viewer's own row when it falls outside `entries` (rank null if not yet ranked). */
   me: LeaderboardEntry | null;
-  /** Wallets ranked in total. */
+  /** Players ranked in total. */
   total: number;
-  /** ISO time the balances were read from the chain. */
-  updatedAt: string;
+  /** Finished games needed to be ranked. */
+  minGames: number;
 }
 
 // ---------------------------------------------------------------------------

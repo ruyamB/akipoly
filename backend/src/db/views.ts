@@ -3,17 +3,20 @@
  * private `me` part is attached per socket from the same data.
  */
 import { getAddress } from 'viem';
-import { env } from '../config/env.js';
+import { arc, env } from '../config/env.js';
 import type { Db } from './pool.js';
 import type { RoundVrf, VrfContracts } from '../shared/protocol.js';
 
-const VRF_COLUMNS = 'vrf_request_id, vrf_request_tx, vrf_request_block, vrf_fulfill_tx, vrf_random_word';
+const VRF_COLUMNS =
+  'vrf_request_id, vrf_request_tx, vrf_request_block, vrf_fulfill_tx, vrf_random_word, vrf_rounds_address, vrf_coordinator';
 interface VrfColumns {
   vrf_request_id: string | null;
   vrf_request_tx: string | null;
   vrf_request_block: bigint | null;
   vrf_fulfill_tx: string | null;
   vrf_random_word: string | null;
+  vrf_rounds_address: string | null;
+  vrf_coordinator: string | null;
 }
 
 function vrfOf(r: VrfColumns): RoundVrf | null {
@@ -24,11 +27,17 @@ function vrfOf(r: VrfColumns): RoundVrf | null {
     requestBlock: r.vrf_request_block.toString(),
     fulfillTx: r.vrf_fulfill_tx,
     randomWord: r.vrf_random_word,
+    rounds: r.vrf_rounds_address,
+    coordinator: r.vrf_coordinator,
   };
 }
 
 export function vrfContracts(): VrfContracts {
-  return { rounds: getAddress(env.VRF_ROUNDS_ADDRESS), coordinator: getAddress(env.VRF_COORDINATOR_ADDRESS) };
+  return {
+    rounds: getAddress(env.VRF_ROUNDS_ADDRESS),
+    coordinator: getAddress(arc.vrf.coordinator),
+    vrfExplorer: arc.vrf.explorerUrl,
+  };
 }
 import type {
   CareerEntry,

@@ -13,8 +13,9 @@
  */
 // Dependency-free on purpose (no viem / ./arc import), so Node tests can run it:
 // callers pass in how to read AkipolyRounds.drawOf (src/lib/arc.ts readRoundDraw).
-// Relative paths, not @shared/*: backend/test/fairness-client.test.ts runs this
-// file under backend's tsx, which doesn't know the site's alias.
+// Relative paths, not @shared/*: backend/test/fairness-client.test.ts and
+// contracts/test/backend-draw.test.ts run this file under their own tsx,
+// which doesn't know the site's alias.
 import { BALL_MAX, BALL_MIN } from '../../backend/src/shared/constants';
 import type { RoundVrf } from '../../backend/src/shared/protocol';
 import { ballFromRandomWord } from '../../backend/src/shared/vrf';

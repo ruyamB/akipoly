@@ -1,18 +1,21 @@
 /**
- * Deploy Akipoly's VRF to Arc (or any EVM RPC):
- *   BlockhashStore → AkipolyVRFCoordinator → AkipolyRounds,
- *   then register the oracle key and allowlist AkipolyRounds as a consumer.
+ * Deploy AkipolyRounds as a consumer of the hosted Arc VRF
+ * (https://arcvrf.007575.xyz/docs), paid from your subscription.
  *
- *   DEPLOYER_PRIVATE_KEY=0x… RPC_URL=https://rpc.testnet.arc.io \
- *   TREASURY_ADDRESS=0x… VRF_ORACLE_KEY=0x… npm run deploy
+ *   RPC_URL=https://rpc.testnet.arc.io DEPLOYER_PRIVATE_KEY=0x… TREASURY_ADDRESS=0x… VRF_SUBSCRIPTION_ID=… npm run deploy
  *
- * Optional: REQUEST_CONFIRMATIONS (default 1), CALLBACK_GAS_LIMIT (default 200000).
- * The oracle key never leaves this machine: only its public key goes on-chain.
- * Prints the env lines for backend/.env.
+ * Optional:
+ *   VRF_COORDINATOR_ADDRESS / VRF_KEY_HASH   default: Arc VRF on Arc Testnet
+ *   CALLBACK_GAS_LIMIT      default 150000 (fulfillRandomWords only stores and emits)
+ *   REQUEST_CONFIRMATIONS   default 0 (Arc finalises on inclusion)
+ *
+ * If the deployer owns the subscription, AkipolyRounds is added as a consumer
+ * here; otherwise add it on the Subscriptions page. Prints the backend/.env lines.
  */
-import { createPublicClient, createWalletClient, defineChain, getAddress, http, type Abi, type Hex } from 'viem';
+import { createPublicClient, createWalletClient, defineChain, getAddress, http, parseAbi, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { keyHashOf, publicKeyOf } from '../../backend/src/chain/vrfProof.js';
+import { ARC_NETWORKS } from '../../backend/src/shared/arc.js';
+import { ARC_VRF_COORDINATOR_ABI } from '../../backend/src/shared/vrf.js';
 import { artifact } from '../test/helpers.js';
 
 function need(name: string): string {
@@ -21,17 +24,22 @@ function need(name: string): string {
   return v;
 }
 
+// Required, not defaulted: a forgotten RPC_URL must not quietly deploy to testnet.
 const rpcUrl = need('RPC_URL');
 const deployer = privateKeyToAccount(need('DEPLOYER_PRIVATE_KEY') as Hex);
 const treasury = getAddress(need('TREASURY_ADDRESS'));
-const oraclePk = publicKeyOf(BigInt(need('VRF_ORACLE_KEY')));
-const keyHash = keyHashOf(oraclePk);
-const confirmations = Number(process.env.REQUEST_CONFIRMATIONS ?? 1);
-const callbackGasLimit = Number(process.env.CALLBACK_GAS_LIMIT ?? 200_000);
+const subId = BigInt(need('VRF_SUBSCRIPTION_ID'));
+const confirmations = Number(process.env.REQUEST_CONFIRMATIONS ?? 0);
+const callbackGasLimit = Number(process.env.CALLBACK_GAS_LIMIT ?? 150_000);
 
 const probe = createPublicClient({ transport: http(rpcUrl) });
+const chainId = await probe.getChainId();
+const known = Object.values(ARC_NETWORKS).find((n) => n.chainId === chainId)?.vrf ?? null;
+const coordinator = getAddress(process.env.VRF_COORDINATOR_ADDRESS ?? known?.coordinator ?? need('VRF_COORDINATOR_ADDRESS'));
+const keyHash = (process.env.VRF_KEY_HASH ?? known?.keyHash ?? need('VRF_KEY_HASH')) as Hex;
+
 const chain = defineChain({
-  id: await probe.getChainId(),
+  id: chainId,
   name: 'target',
   nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
   rpcUrls: { default: { http: [rpcUrl] } },
@@ -39,32 +47,45 @@ const chain = defineChain({
 const pub = createPublicClient({ chain, transport: http(rpcUrl) });
 const wallet = createWalletClient({ chain, transport: http(rpcUrl), account: deployer });
 
-async function deploy(name: string, args: unknown[] = []) {
-  const a = artifact(name);
-  const hash = await wallet.deployContract({ abi: a.abi, bytecode: a.bytecode, args });
-  const r = await pub.waitForTransactionReceipt({ hash });
-  if (r.status !== 'success' || !r.contractAddress) throw new Error(`${name} deploy failed (${hash})`);
-  console.log(`${name}: ${r.contractAddress}`);
-  return r.contractAddress;
-}
+const subscriptionAbi = parseAbi(ARC_VRF_COORDINATOR_ABI);
 
-async function call(address: Hex, abi: Abi, functionName: string, args: unknown[]) {
-  const { request } = await pub.simulateContract({ account: deployer, address, abi, functionName, args });
-  const hash = await wallet.writeContract(request as never);
-  const r = await pub.waitForTransactionReceipt({ hash });
-  if (r.status !== 'success') throw new Error(`${functionName} failed (${hash})`);
-}
+console.log(`chain ${chainId}, deployer ${deployer.address}, treasury ${treasury}`);
+console.log(`Arc VRF coordinator ${coordinator}, key hash ${keyHash}, subscription ${subId}`);
 
-console.log(`chain ${chain.id}, deployer ${deployer.address}, treasury ${treasury}`);
-const store = await deploy('BlockhashStore');
-const coordinator = await deploy('AkipolyVRFCoordinator', [store]);
-const rounds = await deploy('AkipolyRounds', [coordinator, treasury, keyHash, confirmations, callbackGasLimit]);
-const coordAbi = artifact('AkipolyVRFCoordinator').abi;
-await call(coordinator, coordAbi, 'setConfig', [confirmations, 2_500_000]);
-await call(coordinator, coordAbi, 'registerProvingKey', [oraclePk]);
-await call(coordinator, coordAbi, 'addConsumer', [rounds]);
+const [, nativeBalance, , subOwner] = await pub.readContract({
+  address: coordinator,
+  abi: subscriptionAbi,
+  functionName: 'getSubscription',
+  args: [subId],
+});
+
+const a = artifact('AkipolyRounds');
+const hash = await wallet.deployContract({
+  abi: a.abi,
+  bytecode: a.bytecode,
+  args: [coordinator, treasury, keyHash, subId, confirmations, callbackGasLimit],
+});
+const receipt = await pub.waitForTransactionReceipt({ hash });
+if (receipt.status !== 'success' || !receipt.contractAddress) throw new Error(`AkipolyRounds deploy failed (${hash})`);
+const rounds = receipt.contractAddress;
+console.log(`AkipolyRounds: ${rounds}`);
+
+if (getAddress(subOwner) === deployer.address) {
+  const { request } = await pub.simulateContract({
+    account: deployer,
+    address: coordinator,
+    abi: subscriptionAbi,
+    functionName: 'addConsumer',
+    args: [subId, rounds],
+  });
+  const r = await pub.waitForTransactionReceipt({ hash: await wallet.writeContract(request) });
+  if (r.status !== 'success') throw new Error(`addConsumer failed (${r.transactionHash})`);
+  console.log(`added AkipolyRounds as a consumer of subscription ${subId}`);
+} else {
+  console.log(`\n! Subscription ${subId} is owned by ${subOwner}: add ${rounds} as a consumer on its Subscriptions page.`);
+}
+if (nativeBalance === 0n) console.log(`! Subscription ${subId} has no USDC yet: fund it before the first game.`);
 
 console.log(`\n# backend/.env
-VRF_ROUNDS_ADDRESS=${rounds}
-VRF_COORDINATOR_ADDRESS=${coordinator}
-# VRF_ORACLE_KEY=<the key you passed in> (keyHash ${keyHash})`);
+VRF_SUBSCRIPTION_ID=${subId}
+VRF_ROUNDS_ADDRESS=${rounds}`);

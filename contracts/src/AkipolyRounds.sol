@@ -2,21 +2,14 @@
 pragma solidity ^0.8.24;
 
 import {VRFConsumerBase} from "./VRFConsumerBase.sol";
-
-interface IAkipolyVRFCoordinator {
-  function requestRandomWords(
-    bytes32 keyHash,
-    uint16 requestConfirmations,
-    uint32 callbackGasLimit,
-    uint32 numWords
-  ) external returns (uint256 requestId);
-}
+import {ArcVRFClient, IArcVRFCoordinator} from "./ArcVRFClient.sol";
 
 /**
  * @title AkipolyRounds
  * @notice On-chain record of every Akipoly ball. The treasury requests one VRF
- * draw per (game, round) when betting closes. The coordinator calls back with
- * proof-checked randomness, and this contract turns it into the ball digit:
+ * draw per (game, round) when betting closes, paid from an Arc VRF subscription
+ * (https://arcvrf.007575.xyz). The Arc VRF coordinator verifies the proof
+ * on-chain and calls back, and this contract turns the word into the ball digit:
  *
  *     ball = BALL_MIN + randomWords[0] % BALL_RANGE        (0..16)
  *
@@ -35,7 +28,7 @@ contract AkipolyRounds is VRFConsumerBase {
   error AlreadyRequested(bytes16 gameId, uint32 round);
 
   event RequesterSet(address requester);
-  event RequestParamsSet(bytes32 keyHash, uint16 requestConfirmations, uint32 callbackGasLimit);
+  event RequestParamsSet(bytes32 keyHash, uint256 subId, uint16 requestConfirmations, uint32 callbackGasLimit);
   event BallRequested(bytes16 indexed gameId, uint32 indexed round, uint256 requestId);
   event BallDrawn(bytes16 indexed gameId, uint32 indexed round, uint256 requestId, uint256 randomWord, uint8 ball);
 
@@ -55,6 +48,8 @@ contract AkipolyRounds is VRFConsumerBase {
   address public owner;
   address public requester;
   bytes32 public keyHash;
+  /// @notice Arc VRF subscription that pays for every draw (this contract must be a consumer).
+  uint256 public subId;
   uint16 public requestConfirmations;
   uint32 public callbackGasLimit;
 
@@ -65,16 +60,18 @@ contract AkipolyRounds is VRFConsumerBase {
     address coordinator,
     address requester_,
     bytes32 keyHash_,
+    uint256 subId_,
     uint16 requestConfirmations_,
     uint32 callbackGasLimit_
   ) VRFConsumerBase(coordinator) {
     owner = msg.sender;
     requester = requester_;
     keyHash = keyHash_;
+    subId = subId_;
     requestConfirmations = requestConfirmations_;
     callbackGasLimit = callbackGasLimit_;
     emit RequesterSet(requester_);
-    emit RequestParamsSet(keyHash_, requestConfirmations_, callbackGasLimit_);
+    emit RequestParamsSet(keyHash_, subId_, requestConfirmations_, callbackGasLimit_);
   }
 
   modifier onlyOwner() {
@@ -87,12 +84,13 @@ contract AkipolyRounds is VRFConsumerBase {
     emit RequesterSet(requester_);
   }
 
-  /// @notice e.g. to move to a rotated oracle key. Doesn't affect requests already made.
-  function setRequestParams(bytes32 keyHash_, uint16 confirmations_, uint32 gasLimit_) external onlyOwner {
+  /// @notice e.g. to move to a new subscription or key. Doesn't affect requests already made.
+  function setRequestParams(bytes32 keyHash_, uint256 subId_, uint16 confirmations_, uint32 gasLimit_) external onlyOwner {
     keyHash = keyHash_;
+    subId = subId_;
     requestConfirmations = confirmations_;
     callbackGasLimit = gasLimit_;
-    emit RequestParamsSet(keyHash_, confirmations_, gasLimit_);
+    emit RequestParamsSet(keyHash_, subId_, confirmations_, gasLimit_);
   }
 
   function roundKey(bytes16 gameId, uint32 round) public pure returns (bytes32) {
@@ -108,11 +106,15 @@ contract AkipolyRounds is VRFConsumerBase {
     bytes32 key = roundKey(gameId, round);
     if (s_draws[key].requestId != 0) revert AlreadyRequested(gameId, round);
 
-    requestId = IAkipolyVRFCoordinator(COORDINATOR).requestRandomWords(
-      keyHash,
-      requestConfirmations,
-      callbackGasLimit,
-      NUM_WORDS
+    requestId = IArcVRFCoordinator(COORDINATOR).requestRandomWords(
+      ArcVRFClient.RandomWordsRequest({
+        keyHash: keyHash,
+        subId: subId,
+        requestConfirmations: requestConfirmations,
+        callbackGasLimit: callbackGasLimit,
+        numWords: NUM_WORDS,
+        extraArgs: ArcVRFClient.nativeExtraArgs()
+      })
     );
     s_draws[key] = Draw({
       requestId: requestId,

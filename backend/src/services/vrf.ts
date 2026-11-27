@@ -1,43 +1,33 @@
 /**
- * VRF draws: one job per round, run by the single treasury worker.
+ * VRF draws via the hosted Arc VRF: one job per round, run by the single
+ * treasury worker.
  *
  *   pending ──sign+broadcast requestBall──▶ requested
- *   requested ──receipt, wait confirmations, prove, sign+broadcast fulfill──▶ fulfilling
- *   fulfilling ──receipt with BallDrawn──▶ done   (round: drawing → rolling)
- *   any ──reverted / stuck far too long──▶ held  (needs a human; the round waits)
+ *   requested ──Arc VRF delivers (AkipolyRounds.drawOf fulfilled)──▶ done (round: drawing → rolling)
+ *   any ──reverted / request tx stuck far too long / callback failed / round voided──▶ held (needs a human)
  *
- * Each pass moves every open job at most one step without blocking on receipts,
- * so many tables can be drawing at once. A round is never requested a second
- * time: there is no cancel and no re-request. A withheld or stuck draw stays
- * visible (held job, round in 'drawing') and is never silently replaced.
+ * Each pass moves every open job at most one step without blocking, so many
+ * tables can be drawing at once. A round is never requested a second time:
+ * there is no cancel and no re-request (Arc VRF rule: re-requesting a slow
+ * answer would let someone pick the result). A draw that never arrives voids
+ * the round at its deadline (services/game.ts) and is never silently replaced.
  */
 import type pg from 'pg';
-import { getAddress, keccak256, type Address, type Hash, type Hex } from 'viem';
+import { keccak256, type Hash, type Hex } from 'viem';
 import { env } from '../config/env.js';
 import { afterCommit, pool, withTx } from '../db/pool.js';
 import { broadcast, publicClient } from '../chain/usdc.js';
-import {
-  coordinatorAbi,
-  coordinatorAddress,
-  parseFulfillment,
-  parseRequest,
-  readDraw,
-  readStoredBlockhash,
-  signFulfill,
-  signRequestBall,
-  signStoreBlockhash,
-  type VrfRequest,
-} from '../chain/vrf.js';
+import { coordinatorAddress, findFailedCallbacks, findFulfillTx, parseRequest, readDraw, roundsAddress, signRequestBall } from '../chain/vrf.js';
 import { events, lobbyChanged } from '../events.js';
 import { log } from '../log.js';
 
 const ACTIVE_POLL_MS = 250;
 const REBROADCAST_AFTER_MS = 15_000;
 const HOLD_AFTER_MS = 10 * 60_000;
-/** Save the request block's hash to the BlockhashStore once it is this old (window is 256). */
-const STORE_BLOCKHASH_AFTER_BLOCKS = 200n;
+/** How often to look for failed callbacks (one eth_getLogs for all waiting jobs). */
+const FAILURE_SCAN_MS = 10_000;
 
-type JobStatus = 'pending' | 'requested' | 'fulfilling' | 'done' | 'held';
+type JobStatus = 'pending' | 'requested' | 'done' | 'held';
 
 interface JobRow {
   round_id: string;
@@ -48,13 +38,7 @@ interface JobRow {
   request_tx: Hash | null;
   request_raw: Hex | null;
   request_id: string | null;
-  pre_seed: string | null;
   request_block: bigint | null;
-  min_confirmations: number | null;
-  callback_gas_limit: number | null;
-  num_words: number | null;
-  fulfill_tx: Hash | null;
-  fulfill_raw: Hex | null;
   updated_at: Date;
 }
 
@@ -125,30 +109,9 @@ async function nudge(job: JobRow, raw: Hex): Promise<boolean> {
   return false;
 }
 
-function requestFromRow(job: JobRow): VrfRequest {
-  return {
-    requestId: BigInt(job.request_id!),
-    preSeed: BigInt(job.pre_seed!),
-    blockNumber: job.request_block!,
-    minConfirmations: job.min_confirmations!,
-    callbackGasLimit: job.callback_gas_limit!,
-    numWords: job.num_words!,
-    sender: getAddress(env.VRF_ROUNDS_ADDRESS),
-  };
-}
+type Draw = Awaited<ReturnType<typeof readDraw>>;
 
-let blockhashStore: Address | null = null;
-async function storeAddress(): Promise<Address> {
-  blockhashStore ??= await publicClient.readContract({
-    address: coordinatorAddress,
-    abi: coordinatorAbi,
-    functionName: 'BLOCKHASH_STORE',
-  });
-  return blockhashStore;
-}
-const storedFor = new Set<string>();
-
-async function step(job: JobRow, head: bigint): Promise<void> {
+async function step(job: JobRow, prefetched: Draw | null, failed: Set<bigint>): Promise<void> {
   if (job.status === 'pending') {
     const { raw, hash } = await signRequestBall(job.game_id, job.round_number);
     await pool.query(
@@ -162,81 +125,38 @@ async function step(job: JobRow, head: bigint): Promise<void> {
     return;
   }
 
-  if (job.status === 'requested') {
-    if (!job.request_id) {
-      const receipt = await receiptOf(job.request_tx!);
-      if (!receipt) {
-        await nudge(job, job.request_raw!);
-        return;
-      }
-      if (receipt.status !== 'success') return hold(job, `requestBall reverted (${job.request_tx})`);
-      const req = parseRequest(receipt);
-      if (!req) return hold(job, `no RandomWordsRequested in ${job.request_tx}`);
-      await pool.query(
-        `update public.vrf_jobs
-            set request_id = $2, pre_seed = $3, request_block = $4, min_confirmations = $5,
-                callback_gas_limit = $6, num_words = $7, updated_at = now()
-          where round_id = $1`,
-        [job.round_id, req.requestId.toString(), req.preSeed.toString(), req.blockNumber, req.minConfirmations, req.callbackGasLimit, req.numWords],
-      );
-      Object.assign(job, {
-        request_id: req.requestId.toString(),
-        pre_seed: req.preSeed.toString(),
-        request_block: req.blockNumber,
-        min_confirmations: req.minConfirmations,
-        callback_gas_limit: req.callbackGasLimit,
-        num_words: req.numWords,
-      });
-    }
+  if (job.status !== 'requested') return;
 
-    const req = requestFromRow(job);
-    // Chainlink nodes wait for the request's confirmations; blockhash(n) is only
-    // available from block n+1, and a deeper wait guards against reorgs.
-    const confirmations = BigInt(Math.max(1, req.minConfirmations));
-    if (head < req.blockNumber + confirmations) return;
-
-    const age = head - req.blockNumber;
-    if (age >= 256n) {
-      // Past the BLOCKHASH window: only works if the hash made it into the store.
-      const stored = await readStoredBlockhash(await storeAddress(), req.blockNumber);
-      if (!stored) return hold(job, `request block ${req.blockNumber} hash expired and is not in the BlockhashStore`);
-    } else if (age >= STORE_BLOCKHASH_AFTER_BLOCKS && !storedFor.has(job.round_id)) {
-      const { raw } = await signStoreBlockhash(await storeAddress(), req.blockNumber);
-      await send(raw);
-      storedFor.add(job.round_id);
-    }
-
-    const { raw, hash, output } = await signFulfill(req);
-    await pool.query(
-      `update public.vrf_jobs set status = 'fulfilling', fulfill_tx = $2, fulfill_raw = $3, updated_at = now()
-        where round_id = $1 and status = 'requested'`,
-      [job.round_id, hash, raw],
-    );
-    await send(raw);
-    log.info({ gameId: job.game_id, round: job.round_number, tx: hash, output: output.toString() }, 'VRF fulfilled');
-    return;
-  }
-
-  if (job.status === 'fulfilling') {
-    const requestId = BigInt(job.request_id!);
-    const receipt = await receiptOf(job.fulfill_tx!);
+  if (!job.request_id) {
+    const receipt = await receiptOf(job.request_tx!);
     if (!receipt) {
-      await nudge(job, job.fulfill_raw!);
+      await nudge(job, job.request_raw!);
       return;
     }
-    if (receipt.status === 'success') {
-      const f = parseFulfillment(receipt, requestId);
-      if (!f) return hold(job, `no RandomWordsFulfilled in ${job.fulfill_tx}`);
-      if (!f.success || f.ball === null || f.randomWord === null) {
-        return hold(job, `consumer callback failed in ${job.fulfill_tx} (raise callbackGasLimit)`);
-      }
-      return finish(job, f.ball, f.randomWord, job.fulfill_tx!);
-    }
-    // Reverted. Anyone may fulfill, so someone else may have beaten us to it.
-    const draw = await readDraw(job.game_id, job.round_number);
-    if (draw.fulfilled && draw.requestId === requestId) return finish(job, draw.ball, draw.randomWord, null);
-    return hold(job, `fulfillRandomWords reverted (${job.fulfill_tx})`);
+    if (receipt.status !== 'success') return hold(job, `requestBall reverted (${job.request_tx})`);
+    const req = parseRequest(receipt);
+    if (!req) return hold(job, `no BallRequested in ${job.request_tx}`);
+    await pool.query(
+      `update public.vrf_jobs set request_id = $2, request_block = $3, updated_at = now() where round_id = $1`,
+      [job.round_id, req.requestId.toString(), req.blockNumber],
+    );
+    job.request_id = req.requestId.toString();
+    job.request_block = req.blockNumber;
   }
+
+  // Waiting on the Arc VRF: its answer lands in AkipolyRounds.drawOf.
+  const draw = prefetched ?? (await readDraw(job.game_id, job.round_number));
+  if (!draw.fulfilled) {
+    if (failed.has(BigInt(job.request_id))) {
+      return hold(job, 'Arc VRF callback failed (raise callbackGasLimit with AkipolyRounds.setRequestParams)');
+    }
+    return;
+  }
+  if (draw.requestId !== BigInt(job.request_id)) {
+    return hold(job, `drawOf requestId ${draw.requestId} differs from ours ${job.request_id}`);
+  }
+  const fulfillTx = await findFulfillTx(job.game_id, job.round_number, job.request_block!).catch(() => null);
+  return finish(job, draw.ball, draw.randomWord, fulfillTx);
 }
 
 /** Record the on-chain ball and start the roll. */
@@ -246,7 +166,7 @@ async function finish(job: JobRow, ball: number, randomWord: bigint, fulfillTx: 
       `update public.rounds
           set phase = 'rolling', ball = $2, phase_ends_at = now() + $3::interval,
               vrf_request_id = $4, vrf_request_tx = $5, vrf_request_block = $6,
-              vrf_fulfill_tx = $7, vrf_random_word = $8
+              vrf_fulfill_tx = $7, vrf_random_word = $8, vrf_rounds_address = $9, vrf_coordinator = $10
         where id = $1 and phase = 'drawing'`,
       [
         job.round_id,
@@ -257,6 +177,8 @@ async function finish(job: JobRow, ball: number, randomWord: bigint, fulfillTx: 
         job.request_block,
         fulfillTx,
         randomWord.toString(),
+        roundsAddress,
+        coordinatorAddress,
       ],
     );
     await c.query(`update public.vrf_jobs set status = 'done', updated_at = now() where round_id = $1`, [job.round_id]);
@@ -276,29 +198,54 @@ export interface VrfPass {
   blocked: boolean;
 }
 
+let lastFailureScan = 0;
+
+/** Callbacks the coordinator reported as failed, among these unanswered jobs. Throttled. */
+async function failedCallbacks(jobs: JobRow[]): Promise<Set<bigint>> {
+  if (jobs.length === 0 || Date.now() - lastFailureScan < FAILURE_SCAN_MS) return new Set();
+  lastFailureScan = Date.now();
+  const from = jobs.reduce((m, j) => (j.request_block! < m ? j.request_block! : m), jobs[0]!.request_block!);
+  return findFailedCallbacks(
+    jobs.map((j) => BigInt(j.request_id!)),
+    from,
+  );
+}
+
 /** Advance every open VRF job by one step. */
 export async function runVrfJobs(): Promise<VrfPass> {
   const { rows } = await pool.query<JobRow>(
     `select j.round_id, j.game_id, g.lobby_id, j.round_number, j.status, j.request_tx, j.request_raw,
-            j.request_id, j.pre_seed, j.request_block, j.min_confirmations, j.callback_gas_limit,
-            j.num_words, j.fulfill_tx, j.fulfill_raw, j.updated_at
+            j.request_id, j.request_block, j.updated_at
        from public.vrf_jobs j join public.games g on g.id = j.game_id
-      where j.status in ('pending', 'requested', 'fulfilling') and j.next_attempt_at <= now()
+      where j.status in ('pending', 'requested') and j.next_attempt_at <= now()
       order by j.created_at
       limit 50`,
   );
   if (rows.length === 0) {
     const next = await pool.query<{ at: Date | null }>(
-      `select min(next_attempt_at) as at from public.vrf_jobs where status in ('pending', 'requested', 'fulfilling')`,
+      `select min(next_attempt_at) as at from public.vrf_jobs where status in ('pending', 'requested')`,
     );
     const at = next.rows[0]?.at;
     return { delay: at ? Math.max(0, at.getTime() - Date.now()) : null, blocked: false };
   }
 
-  const head = await publicClient.getBlockNumber({ cacheTime: 0 });
+  // Read every waiting draw at once rather than one RPC per job in turn.
+  const waiting = rows.filter((j) => j.status === 'requested' && j.request_id);
+  const draws = new Map(
+    await Promise.all(
+      waiting.map(async (j) => [j.round_id, await readDraw(j.game_id, j.round_number).catch(() => null)] as const),
+    ),
+  );
+  const failed = await failedCallbacks(waiting.filter((j) => draws.get(j.round_id)?.fulfilled === false)).catch(
+    (err: unknown) => {
+      log.warn({ err }, 'failed-callback scan failed');
+      return new Set<bigint>();
+    },
+  );
+
   for (const job of rows) {
     try {
-      await step(job, head);
+      await step(job, draws.get(job.round_id) ?? null, failed);
     } catch (err) {
       if (err instanceof BroadcastFailed) {
         log.warn({ err, roundId: job.round_id }, 'VRF broadcast failed, will retry');

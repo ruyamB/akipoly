@@ -1,213 +1,106 @@
+/**
+ * AkipolyRounds as an Arc VRF consumer, against a recording mock coordinator.
+ * The hosted Arc VRF verifies proofs itself; what we must get right here is
+ * the request we send and how we treat the callback.
+ */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { parseEventLogs, type Hex } from 'viem';
-import {
-  actualSeed,
-  expandRandomWords,
-  generateProof,
-  proofToAbi,
-  verifyProof,
-} from '../../backend/src/chain/vrfProof.js';
-import { expectRevert, gameId, KEY_HASH, ORACLE_PK, ORACLE_SK, setup } from './helpers.js';
+import { decodeAbiParameters, keccak256, parseEventLogs, slice, toBytes } from 'viem';
+import { KEY_HASH, SUB_ID, expectRevert, gameId, setup } from './helpers.js';
 
-describe('AkipolyVRF: request → proof → on-chain verification → ball', () => {
-  it('fulfills a request with a valid proof and records the ball on-chain', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(1), 1);
-    const { proof, output, alpha } = await t.prove(req);
+describe('AkipolyRounds on Arc VRF', async () => {
+  const t = await setup();
+  const { rounds, coordinator } = t.addresses;
+  const { roundsAbi, coordAbi } = t.abis;
 
-    // The off-chain verifier and the on-chain verifier agree.
-    assert.equal(verifyProof({ ...proof, pk: proof.pk, gamma: proof.gamma } as never, alpha), output);
+  const drawOf = (g: `0x${string}`, round: number) =>
+    t.pub.readContract({ address: rounds, abi: roundsAbi, functionName: 'drawOf', args: [g, round] }) as Promise<{
+      requestId: bigint;
+      randomWord: bigint;
+      fulfilled: boolean;
+      ball: number;
+    }>;
 
-    const receipt = await t.fulfill(proof, req.rc);
-    const [fulfilled] = parseEventLogs({
-      abi: t.abis.coordAbi,
-      logs: receipt.logs,
-      eventName: 'RandomWordsFulfilled',
-    }) as unknown as { args: { requestId: bigint; outputSeed: bigint; success: boolean } }[];
-    assert.equal(fulfilled!.args.requestId, req.requestId);
-    assert.equal(fulfilled!.args.outputSeed, output, 'on-chain VRF output == off-chain output');
-    assert.equal(fulfilled!.args.success, true);
-
-    const [drawn] = parseEventLogs({ abi: t.abis.roundsAbi, logs: receipt.logs, eventName: 'BallDrawn' }) as unknown as {
-      args: { gameId: Hex; round: number; randomWord: bigint; ball: number };
-    }[];
-    const [word] = expandRandomWords(output, 1);
-    assert.equal(drawn!.args.randomWord, word);
-    assert.equal(drawn!.args.ball, Number(word! % 17n));
-
-    const [ok, ball] = (await t.pub.readContract({
-      address: t.addresses.rounds,
-      abi: t.abis.roundsAbi,
-      functionName: 'ballOf',
-      args: [gameId(1), 1],
-    })) as [boolean, number];
-    assert.equal(ok, true);
-    assert.equal(ball, drawn!.args.ball);
-    assert.ok(ball >= 0 && ball <= 16);
-
-    assert.equal(
-      await t.pub.readContract({
-        address: t.addresses.coordinator,
-        abi: t.abis.coordAbi,
-        functionName: 'pendingRequestExists',
-        args: [req.requestId],
-      }),
-      false,
-    );
+  it('sends the subscription, key hash and native payment with every request', async () => {
+    const { requestId } = await t.requestBall(gameId(1), 1);
+    const [sender, keyHash, subId, confirmations, gasLimit, numWords, extraArgs] = (await t.pub.readContract({
+      address: coordinator,
+      abi: coordAbi,
+      functionName: 'requests',
+      args: [requestId],
+    })) as [string, string, bigint, number, number, number, `0x${string}`];
+    assert.equal(sender.toLowerCase(), rounds.toLowerCase());
+    assert.equal(keyHash, KEY_HASH);
+    assert.equal(subId, SUB_ID);
+    assert.equal(confirmations, 0);
+    assert.equal(gasLimit, 150_000);
+    assert.equal(numWords, 1);
+    // extraArgs = tag("VRF ExtraArgsV1") ++ abi.encode(ExtraArgsV1{nativePayment: true})
+    assert.equal(slice(extraArgs, 0, 4), slice(keccak256(toBytes('VRF ExtraArgsV1')), 0, 4));
+    const [nativePayment] = decodeAbiParameters([{ type: 'bool' }], slice(extraArgs, 4));
+    assert.equal(nativePayment, true);
   });
 
-  it('derives preSeed and requestId exactly like VRFCoordinatorV2_5', async () => {
-    const { keccak256, encodeAbiParameters } = await import('viem');
-    const t = await setup();
-    const req = await t.requestBall(gameId(2), 0);
-    const preSeed = BigInt(
-      keccak256(
-        encodeAbiParameters(
-          [{ type: 'bytes32' }, { type: 'address' }, { type: 'uint64' }],
-          [KEY_HASH, t.addresses.rounds, 1n],
-        ),
-      ),
-    );
-    assert.equal(req.preSeed, preSeed);
-    assert.equal(
-      req.requestId,
-      BigInt(keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], [KEY_HASH, preSeed]))),
-    );
+  it('only the requester can request, and each round only once', async () => {
+    await expectRevert(t.requestBall(gameId(2), 1, t.accounts.stranger), 'OnlyRequester');
+    await t.requestBall(gameId(2), 1);
+    await expectRevert(t.requestBall(gameId(2), 1), 'AlreadyRequested');
+    await t.requestBall(gameId(2), 2); // the next round is a new draw
   });
 
-  it('rejects tampered proofs', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(3), 1);
-    const { proof } = await t.prove(req);
-    const bump = (v: bigint) => v + 1n;
+  it('turns the delivered word into the ball on-chain', async () => {
+    const { requestId } = await t.requestBall(gameId(3), 1);
+    assert.equal((await drawOf(gameId(3), 1)).fulfilled, false);
+    const word = 2n ** 255n + 12345n;
+    const receipt = await t.fulfill(requestId, word);
+    const d = await drawOf(gameId(3), 1);
+    assert.equal(d.fulfilled, true);
+    assert.equal(d.requestId, requestId);
+    assert.equal(d.randomWord, word);
+    assert.equal(d.ball, Number(word % 17n));
+    assert.ok(receipt.logs.some((l) => l.address.toLowerCase() === rounds.toLowerCase()), 'BallDrawn emitted');
+  });
 
-    // c feeds the first check (u = c*pk + s*G), so a bumped c fails there.
-    await expectRevert(t.fulfill({ ...proof, c: bump(proof.c) }, req.rc), 'addr(c*pk+s*g)!=_uWitness');
-    await expectRevert(t.fulfill({ ...proof, s: bump(proof.s) }, req.rc), 'addr(c*pk+s*g)!=_uWitness');
-    await expectRevert(t.fulfill({ ...proof, gamma: [proof.gamma[0], bump(proof.gamma[1])] }, req.rc), 'gamma is not on curve');
-    await expectRevert(t.fulfill({ ...proof, zInv: bump(proof.zInv) }, req.rc), 'invZ must be inverse of z');
+  it('only the coordinator can deliver a word', async () => {
+    const { requestId } = await t.requestBall(gameId(4), 1);
     await expectRevert(
-      t.fulfill({ ...proof, uWitness: '0x000000000000000000000000000000000000dEaD' }, req.rc),
-      'addr(c*pk+s*g)!=_uWitness',
-    );
-    // A valid-looking proof for a different gamma (another key's output) fails too.
-    const other = generateProof(0xbadbadn, req.preSeed, 1n).proof;
-    await expectRevert(t.fulfill({ ...proof, gamma: other.gamma }, req.rc), 'First mul check failed');
-  });
-
-  it('rejects a proof over the wrong input (e.g. a different block hash)', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(4), 1);
-    await t.test.mine({ blocks: 1 });
-    // Prove over the block BEFORE the request: a real hash, but not the one committed to.
-    const parent = await t.pub.getBlock({ blockNumber: req.rc.blockNum - 1n });
-    const wrongAlpha = actualSeed(req.preSeed, parent.hash!);
-    const { proof } = generateProof(ORACLE_SK, req.preSeed, wrongAlpha);
-    // The contract hashes the committed input to a different curve point H, so the
-    // prover's s*H witness no longer matches.
-    await expectRevert(t.fulfill(proofToAbi(proof), req.rc), 'Second mul check failed');
-  });
-
-  it('rejects a proof from an unregistered key', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(5), 1);
-    const { proof } = await t.prove(req, 0xabcdefn);
-    await expectRevert(t.fulfill(proof, req.rc), 'NoSuchProvingKey');
-  });
-
-  it('rejects a wrong request commitment', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(6), 1);
-    const { proof } = await t.prove(req);
-    await expectRevert(t.fulfill(proof, { ...req.rc, blockNum: req.rc.blockNum - 1n }), 'IncorrectCommitment');
-    await expectRevert(t.fulfill(proof, { ...req.rc, numWords: 2 }), 'IncorrectCommitment');
-  });
-
-  it('cannot fulfill twice', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(7), 1);
-    const { proof } = await t.prove(req);
-    await t.fulfill(proof, req.rc);
-    await expectRevert(t.fulfill(proof, req.rc), 'NoCorrespondingRequest');
-  });
-
-  it('only the treasury can request, and each round only once', async () => {
-    const t = await setup();
-    await expectRevert(t.requestBall(gameId(8), 1, t.accounts.stranger), 'OnlyRequester');
-    await t.requestBall(gameId(8), 1);
-    await expectRevert(t.requestBall(gameId(8), 1), 'AlreadyRequested');
-    // A different round of the same game is fine.
-    await t.requestBall(gameId(8), 2);
-  });
-
-  it('only allowlisted consumers can call the coordinator directly', async () => {
-    const t = await setup();
-    await expectRevert(
-      t.send(t.accounts.stranger, t.addresses.coordinator, t.abis.coordAbi, 'requestRandomWords', [KEY_HASH, 1, 100000, 1]),
-      'InvalidConsumer',
-    );
-  });
-
-  it('only the coordinator can deliver words to the consumer', async () => {
-    const t = await setup();
-    await expectRevert(
-      t.send(t.accounts.stranger, t.addresses.rounds, t.abis.roundsAbi, 'rawFulfillRandomWords', [1n, [7n]]),
+      t.send(t.accounts.stranger, rounds, roundsAbi, 'rawFulfillRandomWords', [requestId, [7n]]),
       'OnlyCoordinatorCanFulfill',
     );
   });
 
-  it('a failing consumer callback does not undo the fulfillment', async () => {
-    // 1000 gas is far too little for the callback's storage writes.
-    const t = await setup({ callbackGasLimit: 1000 });
-    const req = await t.requestBall(gameId(9), 1);
-    const { proof } = await t.prove(req);
-    const receipt = await t.fulfill(proof, req.rc);
-    const [ev] = parseEventLogs({ abi: t.abis.coordAbi, logs: receipt.logs, eventName: 'RandomWordsFulfilled' }) as unknown as {
-      args: { success: boolean };
-    }[];
-    assert.equal(ev!.args.success, false);
-    await expectRevert(t.fulfill(proof, req.rc), 'NoCorrespondingRequest');
+  it('ignores a second answer and answers it never asked for, without reverting', async () => {
+    const { requestId } = await t.requestBall(gameId(5), 1);
+    await t.fulfill(requestId, 17n * 3n + 5n); // ball 5
+    await t.fulfill(requestId, 17n * 3n + 9n); // must not overwrite
+    assert.equal((await drawOf(gameId(5), 1)).ball, 5);
+    // An unknown request id: the callback returns quietly (a revert would still be charged).
+    await t.send(t.accounts.fulfiller, coordinator, coordAbi, 'fulfillRaw', [rounds, 999_999n, 1n]);
   });
 
-  it('fulfills after 256 blocks through the BlockhashStore, never by re-requesting', async () => {
-    const t = await setup();
-    const req = await t.requestBall(gameId(10), 1);
-    const { proof } = await t.prove(req);
-    await t.send(t.accounts.fulfiller, t.addresses.store, t.abis.storeAbi, 'store', [req.rc.blockNum]);
-    await t.test.mine({ blocks: 300 });
-    await t.fulfill(proof, req.rc);
-
-    // Without a stored hash, an old request cannot be fulfilled (but stays pending).
-    const late = await t.requestBall(gameId(10), 2);
-    const lateProof = await t.prove(late);
-    await t.test.mine({ blocks: 300 });
-    await expectRevert(t.fulfill(lateProof.proof, late.rc), 'BlockhashNotInStore');
-  });
-
-  it('balls are spread over 0..16', async () => {
-    const t = await setup();
-    const seen = new Set<number>();
-    for (let r = 1; r <= 25; r++) {
-      const req = await t.requestBall(gameId(11), r);
-      const { proof, output } = await t.prove(req);
-      await t.fulfill(proof, req.rc);
-      const ball = Number(expandRandomWords(output, 1)[0]! % 17n);
-      seen.add(ball);
+  it('a callback that runs out of gas leaves the draw empty and is reported as failed', async () => {
+    await t.send(t.accounts.owner, rounds, roundsAbi, 'setRequestParams', [KEY_HASH, SUB_ID, 0, 5_000]);
+    try {
+      const { requestId } = await t.requestBall(gameId(6), 1);
+      const receipt = await t.fulfill(requestId, 42n);
+      assert.equal((await drawOf(gameId(6), 1)).fulfilled, false);
+      const [ev] = parseEventLogs({ abi: coordAbi, logs: receipt.logs, eventName: 'RandomWordsFulfilled' }) as unknown as {
+        args: { requestId: bigint; success: boolean };
+      }[];
+      assert.equal(ev!.args.requestId, requestId);
+      assert.equal(ev!.args.success, false);
+    } finally {
+      await t.send(t.accounts.owner, rounds, roundsAbi, 'setRequestParams', [KEY_HASH, SUB_ID, 0, 150_000]);
     }
-    assert.ok(seen.size >= 8, `expected a spread of balls, saw ${[...seen].join(',')}`);
   });
 
-  it('keyHash matches the registered public key', async () => {
-    const t = await setup();
-    assert.equal(
-      await t.pub.readContract({
-        address: t.addresses.coordinator,
-        abi: t.abis.coordAbi,
-        functionName: 'hashOfKey',
-        args: [ORACLE_PK],
-      }),
-      KEY_HASH,
+  it('only the owner can change the subscription or key', async () => {
+    await expectRevert(
+      t.send(t.accounts.stranger, rounds, roundsAbi, 'setRequestParams', [KEY_HASH, 1n, 0, 150_000]),
+      'OnlyOwner',
     );
+    await t.send(t.accounts.owner, rounds, roundsAbi, 'setRequestParams', [KEY_HASH, 77n, 0, 150_000]);
+    assert.equal(await t.pub.readContract({ address: rounds, abi: roundsAbi, functionName: 'subId' }), 77n);
+    await t.send(t.accounts.owner, rounds, roundsAbi, 'setRequestParams', [KEY_HASH, SUB_ID, 0, 150_000]);
   });
 });

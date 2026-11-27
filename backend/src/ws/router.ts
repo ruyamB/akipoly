@@ -76,7 +76,7 @@ const handlers: { [T in Exclude<ClientMessage['type'], 'auth'>]: Handler<T> } = 
     s.send({ type: 'career', reqId: m.reqId, games: await careerFor(pool, s.userId) });
     return undefined;
   },
-  'leaderboard.get': async (s) => leaderboardFor(await walletOf(s)),
+  'leaderboard.get': async (s) => leaderboardFor(s.userId),
 };
 
 async function authenticate(s: Session, msg: Extract<ClientMessage, { type: 'auth' }>) {

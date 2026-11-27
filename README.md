@@ -64,14 +64,13 @@ Rounds move through the phases `betting → drawing → rolling → settled`.
 
 ## Provably fair randomness
 
-Balls are drawn by Akipoly's own VRF on Arc (`contracts/`), modelled on Chainlink VRF v2.5:
+Balls are drawn by the hosted [Arc VRF](https://arcvrf.007575.xyz/docs) (Chainlink VRF v2.5-style, paid in USDC from a subscription):
 
-1. When calls close, the treasury calls `AkipolyRounds.requestBall(game, round)`.
-2. The coordinator derives the VRF input only from on-chain data, `keccak256(preSeed, blockhash(requestBlock))`, so nobody, including the operator, can know it before the request lands.
-3. The oracle proves the VRF output with its registered key, and the coordinator verifies the proof on-chain. An invalid proof reverts, so the oracle can only withhold a ball, never choose one.
-4. `AkipolyRounds` sets `ball = randomWord % 17`. A round can never be re-requested.
+1. Calls close first. Only then does the treasury call `AkipolyRounds.requestBall(game, round)`, which asks the Arc VRF coordinator for one word using our key hash and `VRF_SUBSCRIPTION_ID`.
+2. The Arc VRF answers with a proof, the coordinator verifies it on-chain, and only then calls `AkipolyRounds` back with the word. Nobody can rig the number, including the VRF operator and us.
+3. `AkipolyRounds` sets `ball = randomWord % 17` on-chain. A round can never be re-requested, so a slow answer can't be swapped for a better one.
 
-If a draw is not fulfilled within `VRF_DRAW_TIMEOUT_MS`, the round is voided and side bets are refunded. The in-game "provably fair" panel and the game review link to the request and fulfilment transactions so anyone can check them.
+The game server holds no VRF key: it only sends the request and reads `AkipolyRounds.drawOf`. If a draw is not delivered within `VRF_DRAW_TIMEOUT_MS`, the round is voided and side bets are refunded. The game review links every ball to its Arc VRF proof page (`/requests/<requestId>`) and re-reads the result from the chain in your browser.
 
 ## Architecture
 
@@ -84,7 +83,7 @@ If a draw is not fulfilled within `VRF_DRAW_TIMEOUT_MS`, the round is voided and
            │ Privy embedded wallet              │ SQL          │ viem
            ▼                                    ▼              ▼
 ┌────────────────────────┐            ┌────────────────┐ ┌──────────────────────┐
-│  Arc (USDC, ERC-20)    │◀───────────│ Postgres (Neon)│ │ Arc: VRF coordinator │
+│  Arc (USDC, ERC-20)    │◀───────────│ Postgres (Neon)│ │ Arc VRF + Rounds     │
 └────────────────────────┘            └────────────────┘ │ + AkipolyRounds      │
                                                          └──────────────────────┘
 ```
@@ -145,10 +144,10 @@ npm test                  # rules and fairness unit tests
 cd contracts
 npm install
 npm test                  # compile and run the Ganache test suite
-npm run deploy            # deploy the VRF coordinator and AkipolyRounds to Arc
+RPC_URL=https://rpc.testnet.arc.io DEPLOYER_PRIVATE_KEY=0x… TREASURY_ADDRESS=0x… VRF_SUBSCRIPTION_ID=… npm run deploy
 ```
 
-Copy the deployed addresses into `VRF_COORDINATOR_ADDRESS` and `VRF_ROUNDS_ADDRESS` in `backend/.env`.
+Before deploying, create a subscription on [Arc VRF → Subscriptions](https://arcvrf.007575.xyz/subscriptions) and fund it with USDC (1 USDC covers plenty of test draws). `npm run deploy` deploys `AkipolyRounds` against the Arc VRF coordinator, adds it as a consumer if the deployer owns the subscription (otherwise add it on the subscription page), and prints `VRF_SUBSCRIPTION_ID` and `VRF_ROUNDS_ADDRESS` for `backend/.env`.
 
 ## Configuration
 
@@ -174,8 +173,9 @@ Without `DATABASE_URL`, the waitlist endpoint returns a friendly 503 instead of 
 | `PRIVY_APP_ID`                                   | Used to verify players' identity tokens.                       |
 | `ARC_NETWORK`, `ARC_RPC_URL`                     | `testnet` (chain 5042002) or `mainnet` (chain 5042); optional RPC override. |
 | `TREASURY_PRIVATE_KEY`                           | Hot wallet that receives buy-ins and sends payouts.            |
-| `VRF_COORDINATOR_ADDRESS`, `VRF_ROUNDS_ADDRESS`  | Deployed contract addresses.                                   |
-| `VRF_ORACLE_KEY`, `VRF_DRAW_TIMEOUT_MS`          | Oracle proving key and the deadline before a round is voided.  |
+| `VRF_SUBSCRIPTION_ID`, `VRF_ROUNDS_ADDRESS`      | Arc VRF subscription that pays for draws, and the deployed `AkipolyRounds`. |
+| `VRF_COORDINATOR_ADDRESS`, `VRF_KEY_HASH`        | Only for networks without a built-in Arc VRF deployment (Arc Testnet is built in). |
+| `VRF_DRAW_TIMEOUT_MS`                            | Deadline before an undelivered round is voided.                |
 | `HOUSE_FEE_BPS`, `MIN_BUY_IN_USDC`, `MAX_BUY_IN_USDC`, `MAX_SIDE_BET_USDC` | Table economics.       |
 | `MAX_AUTO_PAYOUT_USDC`                           | Payouts above this are held for manual review.                 |
 | `BETTING_SECONDS`, `ROLLING_MS`, `MAX_ROUNDS`    | Game timing.                                                   |
@@ -222,8 +222,16 @@ docker compose -p akipoly-loadtest -f docker-compose.loadtest.yml down -v
 `-p akipoly-loadtest` keeps the test on its own Docker network, apart from the real server (`COMPOSE_PROJECT_NAME` would otherwise override the file's `name:`). If you ran the load test before it had its own project name, remove the old database once, from `backend/`:
 
 ```sh
-docker ps -aq -f label=com.docker.compose.project=$(basename "$PWD") -f label=com.docker.compose.service=db | xargs -r docker rm -fv
+docker ps -aq -f label=com.docker.compose.project.config_files="$PWD/docker-compose.loadtest.yml" -f label=com.docker.compose.service=db | xargs -r docker rm -fv
 ```
+
+PowerShell:
+
+```powershell
+docker ps -aq -f "label=com.docker.compose.project.config_files=$PWD\docker-compose.loadtest.yml" -f label=com.docker.compose.service=db | ForEach-Object { docker rm -fv $_ }
+```
+
+It matches on the compose file path, so it only touches this repo's load-test db whatever project name the old run used. Check `docker ps` afterwards if you ran it with a different `-f` path.
 
 Connection limits: 5 sockets per player (the oldest is closed), `MAX_CONNECTIONS` in total, and clients with more than 1 MB of unsent data are dropped.
 
@@ -245,12 +253,12 @@ akipoly/
 │   ├── src/config/             validated environment (fails fast)
 │   ├── src/db/                 pool, migration runner, read models
 │   ├── src/domain/             pure game rules (unit tested)
-│   ├── src/chain/              USDC verification, treasury transactions, VRF prover
+│   ├── src/chain/              USDC verification, treasury transactions, Arc VRF client
 │   ├── src/services/           lobby and game state machines, VRF draws, payouts
 │   ├── src/scheduler/          advances due rounds and countdowns
 │   ├── src/ws/                 transport, router, per-user push hub
 │   └── migrations/             SQL migrations
-├── contracts/                  VRF coordinator, verifier, BlockhashStore, AkipolyRounds
+├── contracts/                  AkipolyRounds (Arc VRF consumer) + test mock coordinator
 └── public/                     icons and static assets
 ```
 
@@ -258,7 +266,7 @@ akipoly/
 
 - **Never commit secrets.** `.env` files are git-ignored; only the `.env.example` templates belong in the repo.
 - **The treasury is a custodial hot wallet.** Keep its balance small and sweep it regularly. Payouts above `MAX_AUTO_PAYOUT_USDC`, or that never land, are marked `held` for manual review.
-- **Guard `VRF_ORACLE_KEY`** as carefully as the treasury key. It is used only for proofs and should never hold funds.
+- **Keep the Arc VRF subscription funded.** The server warns at boot when it runs low; an empty subscription stalls draws until rounds void. The Arc VRF is unaudited testnet software with a single operator: it can delay an answer but not change it.
 - If you find a vulnerability, please report it privately to the maintainers rather than opening a public issue.
 
 ## Contributing
@@ -273,4 +281,4 @@ Contributions are welcome.
 
 Released under the [MIT License](LICENSE).
 
-Parts of `contracts/` (the VRF verifier, BlockhashStore and consumer base) are adapted from [Chainlink](https://github.com/smartcontractkit/chainlink), which is also MIT-licensed.
+`contracts/src/ArcVRFClient.sol` is copied from [arc-vrf](https://github.com/HimanshuM685/arc-vrf) and the consumer base follows [Chainlink](https://github.com/smartcontractkit/chainlink)'s; both are MIT-licensed.

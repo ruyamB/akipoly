@@ -5,8 +5,8 @@
  *
  * The ball is decided on-chain by AkipolyRounds:
  *     ball = BALL_MIN + randomWord % 17
- * where randomWord = keccak256(abi.encode(vrfOutput, 0)) and vrfOutput is
- * proven by the coordinator's on-chain VRF verifier.
+ * where randomWord is delivered by the hosted Arc VRF coordinator after it
+ * verified the VRF proof on-chain (https://arcvrf.007575.xyz).
  */
 import { BALL_MAX, BALL_MIN } from './constants.js';
 
@@ -32,27 +32,22 @@ export const AKIPOLY_ROUNDS_ABI = [
   'function ballOf(bytes16 gameId, uint32 round) view returns (bool fulfilled, uint8 ball)',
   'function requester() view returns (address)',
   'function keyHash() view returns (bytes32)',
+  'function subId() view returns (uint256)',
   'function requestConfirmations() view returns (uint16)',
   'function COORDINATOR() view returns (address)',
   'event BallRequested(bytes16 indexed gameId, uint32 indexed round, uint256 requestId)',
   'event BallDrawn(bytes16 indexed gameId, uint32 indexed round, uint256 requestId, uint256 randomWord, uint8 ball)',
 ] as const;
 
-/** Human-readable ABI of AkipolyVRFCoordinator (the part the oracle uses). */
-export const VRF_COORDINATOR_ABI = [
-  'struct Proof { uint256[2] pk; uint256[2] gamma; uint256 c; uint256 s; uint256 seed; address uWitness; uint256[2] cGammaWitness; uint256[2] sHashWitness; uint256 zInv; }',
-  'struct RequestCommitment { uint64 blockNum; uint32 callbackGasLimit; uint32 numWords; address sender; }',
-  'function fulfillRandomWords(Proof proof, RequestCommitment rc) returns (uint256 outputSeed)',
-  'function hashOfKey(uint256[2] publicKey) pure returns (bytes32)',
-  'function s_provingKeys(bytes32 keyHash) view returns (bool)',
-  'function s_consumers(address consumer) view returns (bool)',
-  'function pendingRequestExists(uint256 requestId) view returns (bool)',
-  'function BLOCKHASH_STORE() view returns (address)',
-  'event RandomWordsRequested(bytes32 indexed keyHash, uint256 requestId, uint256 preSeed, uint16 minimumRequestConfirmations, uint32 callbackGasLimit, uint32 numWords, address indexed sender)',
-  'event RandomWordsFulfilled(uint256 indexed requestId, uint256 outputSeed, bool success)',
+/** Human-readable ABI of the hosted Arc VRF coordinator (backend reads, deploy script adds the consumer). */
+export const ARC_VRF_COORDINATOR_ABI = [
+  'function getSubscription(uint256 subId) view returns (uint96 balance, uint96 nativeBalance, uint64 reqCount, address owner, address[] consumers)',
+  'function addConsumer(uint256 subId, address consumer)',
+  'function s_provingKeys(bytes32 keyHash) view returns (bool exists, uint64 maxGas)',
+  // success=false: the consumer callback reverted or ran out of gas, and the request is gone.
+  'event RandomWordsFulfilled(uint256 indexed requestId, uint256 outputSeed, uint256 indexed subId, uint96 payment, bool nativePayment, bool success, bool onlyPremium)',
 ] as const;
 
-export const BLOCKHASH_STORE_ABI = [
-  'function store(uint256 n)',
-  'function getBlockhash(uint256 n) view returns (bytes32)',
-] as const;
+/** Public proof page for a request on the Arc VRF explorer. */
+export const vrfProofUrl = (explorerUrl: string, requestId: string | bigint) =>
+  `${explorerUrl.replace(/\/$/, '')}/requests/${requestId}`;

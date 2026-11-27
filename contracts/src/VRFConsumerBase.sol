@@ -3,7 +3,9 @@ pragma solidity ^0.8.24;
 
 /**
  * @title VRFConsumerBase
- * @notice Inherit from this to receive randomness from AkipolyVRFCoordinator.
+ * @notice Inherit from this to receive randomness from the Arc VRF coordinator.
+ * Same callback as arc-vrf's ArcVRFConsumerBase (rawFulfillRandomWords), with
+ * the coordinator fixed at deploy time instead of owner-settable.
  *
  * Simplified from Chainlink's VRFConsumerBaseV2Plus (MIT License, Copyright (c) 2018 SmartContract ChainLink, Ltd.).
  * The coordinator is fixed at deploy time, and rawFulfillRandomWords only accepts

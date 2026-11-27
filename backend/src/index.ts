@@ -82,6 +82,7 @@ async function startTreasuryWhenWired(): Promise<void> {
       process.exit(1);
     }
     if (!check.unreachable) {
+      for (const warning of check.warnings) log.warn({ warning }, 'Arc VRF subscription needs attention');
       startTreasuryWorker();
       return;
     }

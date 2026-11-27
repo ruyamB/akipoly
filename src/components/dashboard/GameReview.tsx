@@ -4,6 +4,7 @@ import { useGameSocket } from '../../features/game/GameSocket';
 import { BALL_COLORS, DARK_BALLS } from '../../features/game/BallReel';
 import { addressUrl, formatUsdc, readRoundDraw, txUrl } from '../../lib/arc';
 import { verifyLegacyRound, verifyVrfRound } from '../../lib/fairness';
+import { vrfProofUrl } from '@shared/vrf';
 
 interface Props {
   gameId: string;
@@ -68,7 +69,9 @@ export default function GameReview({ gameId, onBack }: Props) {
     Promise.all(
       review.rounds.map(async (r): Promise<readonly [number, boolean | null]> => {
         if (r.vrf) {
-          const v = await verifyVrfRound(readRoundDraw(review.vrfContracts.rounds), review.gameId, r.number, r.ball, r.vrf);
+          // Check against the contract that drew it, not today's (it may have been redeployed).
+          if (!r.vrf.rounds) return [r.number, null] as const;
+          const v = await verifyVrfRound(readRoundDraw(r.vrf.rounds), review.gameId, r.number, r.ball, r.vrf);
           return [r.number, v === 'unavailable' ? null : v === 'verified'] as const;
         }
         if (r.legacy) {
@@ -332,12 +335,25 @@ export default function GameReview({ gameId, onBack }: Props) {
                     className={`review__fair ${ok === false ? 'review__fair--bad' : ok === null ? 'review__fair--na' : ''}`}
                     title={
                       r.vrf
-                        ? 'ball read from the AkipolyRounds contract on Arc, where the VRF proof was verified'
+                        ? 'ball read from the AkipolyRounds contract on Arc; the Arc VRF proof was verified on-chain'
                         : 'ball recomputed in your browser from the revealed seed'
                     }
                   >
                     {ok === undefined ? 'checking…' : ok === null ? "can't check" : ok ? '✓ fair' : '✗ mismatch'}
                   </span>
+                  {r.vrf &&
+                    review.vrfContracts.vrfExplorer &&
+                    r.vrf.coordinator?.toLowerCase() === review.vrfContracts.coordinator.toLowerCase() && (
+                    <a
+                      className="review__proof"
+                      href={vrfProofUrl(review.vrfContracts.vrfExplorer, r.vrf.requestId)}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="step-by-step VRF proof for this ball on Arc VRF"
+                    >
+                      proof ↗
+                    </a>
+                  )}
                 </div>
 
                 {r.number > 0 && (
@@ -397,7 +413,7 @@ export default function GameReview({ gameId, onBack }: Props) {
                       {r.vrf.fulfillTx && (
                         <>
                           {' '}
-                          · proof:{' '}
+                          · delivered:{' '}
                           <a href={txUrl(r.vrf.fulfillTx)} target="_blank" rel="noreferrer">
                             <code>{shortHash(r.vrf.fulfillTx)}</code>
                           </a>

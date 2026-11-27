@@ -34,8 +34,7 @@ process.env.TREASURY_PRIVATE_KEY ??= `0x${randomBytes(32).toString('hex')}`;
 process.env.LOG_LEVEL ??= 'warn';
 // No chain here: VRF draws are answered by the stand-in below.
 process.env.VRF_ROUNDS_ADDRESS ??= `0x${'11'.repeat(20)}`;
-process.env.VRF_COORDINATOR_ADDRESS ??= `0x${'22'.repeat(20)}`;
-process.env.VRF_ORACLE_KEY ??= `0x${randomBytes(32).toString('hex')}`;
+process.env.VRF_SUBSCRIPTION_ID ??= '1';
 /** Simulated request + proof round trip on Arc. */
 const VRF_LATENCY_MS = Number(process.env.LOADTEST_VRF_MS ?? 1500);
 

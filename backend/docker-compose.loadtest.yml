@@ -3,8 +3,9 @@
 #   docker compose -p akipoly-loadtest -f docker-compose.loadtest.yml down -v
 # Own project name so it doesn't share a network with the real server. `name:`
 # loses to COMPOSE_PROJECT_NAME, so the commands above pin it with -p too.
-# Ran it before the rename? Remove the old db once (match by compose labels, not name):
-#   docker ps -aq -f label=com.docker.compose.project=$(basename "$PWD") -f label=com.docker.compose.service=db | xargs -r docker rm -fv
+# Ran it before the rename? Remove the old db once, from backend/ (POSIX shell; README has
+# the PowerShell form). Matches this compose file's path, not the project name:
+#   docker ps -aq -f label=com.docker.compose.project.config_files="$PWD/docker-compose.loadtest.yml" -f label=com.docker.compose.service=db | xargs -r docker rm -fv
 # The project name is set in 3 places that must change together: this `name:`,
 # every `-p` above, and the loadtest section of README.md.
 name: akipoly-loadtest

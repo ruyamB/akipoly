@@ -1,6 +1,7 @@
 /**
- * Akipoly VRF on Arc: the treasury's calls to AkipolyRounds and the oracle side
- * of the coordinator (the job a Chainlink VRF node does).
+ * Arc VRF on Arc: the treasury asks AkipolyRounds for a ball, the hosted Arc VRF
+ * (https://arcvrf.007575.xyz) proves and delivers the word, and we read the
+ * on-chain result back. This server never holds a VRF key or fulfils anything.
  */
 import {
   BaseError,
@@ -16,47 +17,18 @@ import {
   type Hex,
   type TransactionReceipt,
 } from 'viem';
-import { env } from '../config/env.js';
-import { AKIPOLY_ROUNDS_ABI, BLOCKHASH_STORE_ABI, VRF_COORDINATOR_ABI, gameIdToBytes16 } from '../shared/vrf.js';
+import { arc, env } from '../config/env.js';
+import { AKIPOLY_ROUNDS_ABI, ARC_VRF_COORDINATOR_ABI, gameIdToBytes16 } from '../shared/vrf.js';
 import { publicClient, signTreasuryTx, treasuryAddress } from './usdc.js';
-import {
-  actualSeed,
-  generateProof,
-  keyHashOf,
-  proofToAbi,
-  publicKeyOf,
-  verifyProof,
-} from './vrfProof.js';
 
 export const roundsAbi = parseAbi(AKIPOLY_ROUNDS_ABI);
-export const coordinatorAbi = parseAbi(VRF_COORDINATOR_ABI);
-const storeAbi = parseAbi(BLOCKHASH_STORE_ABI);
+const coordinatorAbi = parseAbi(ARC_VRF_COORDINATOR_ABI);
 
 export const roundsAddress: Address = getAddress(env.VRF_ROUNDS_ADDRESS);
-export const coordinatorAddress: Address = getAddress(env.VRF_COORDINATOR_ADDRESS);
+export const coordinatorAddress: Address = getAddress(arc.vrf.coordinator);
 
-const oracleSecret = BigInt(env.VRF_ORACLE_KEY);
-export const oraclePublicKey = publicKeyOf(oracleSecret);
-export const oracleKeyHash: Hex = keyHashOf(oraclePublicKey);
-
-/** The coordinator data needed to fulfill a request, read from its RandomWordsRequested log. */
-export interface VrfRequest {
-  requestId: bigint;
-  preSeed: bigint;
-  blockNumber: bigint;
-  minConfirmations: number;
-  callbackGasLimit: number;
-  numWords: number;
-  sender: Address;
-}
-
-export interface VrfFulfillment {
-  success: boolean;
-  outputSeed: bigint;
-  /** null if the consumer callback failed */
-  ball: number | null;
-  randomWord: bigint | null;
-}
+/** Below this native balance the subscription may stop paying for draws (warn only). */
+const LOW_SUBSCRIPTION_BALANCE = 10n ** 17n; // 0.1 USDC (native, 18 decimals)
 
 export function signRequestBall(gameId: string, roundNumber: number): Promise<{ raw: Hex; hash: Hash }> {
   return signTreasuryTx(
@@ -65,79 +37,12 @@ export function signRequestBall(gameId: string, roundNumber: number): Promise<{ 
   );
 }
 
-export function parseRequest(receipt: TransactionReceipt): VrfRequest | null {
-  const ev = parseEventLogs({ abi: coordinatorAbi, eventName: 'RandomWordsRequested', logs: receipt.logs }).find(
-    (l) => getAddress(l.address) === coordinatorAddress && getAddress(l.args.sender) === roundsAddress,
+/** The requestId AkipolyRounds got from the coordinator, from its BallRequested log. */
+export function parseRequest(receipt: TransactionReceipt): { requestId: bigint; blockNumber: bigint } | null {
+  const ev = parseEventLogs({ abi: roundsAbi, eventName: 'BallRequested', logs: receipt.logs }).find(
+    (l) => getAddress(l.address) === roundsAddress,
   );
-  if (!ev) return null;
-  return {
-    requestId: ev.args.requestId,
-    preSeed: ev.args.preSeed,
-    blockNumber: receipt.blockNumber,
-    minConfirmations: ev.args.minimumRequestConfirmations,
-    callbackGasLimit: ev.args.callbackGasLimit,
-    numWords: ev.args.numWords,
-    sender: getAddress(ev.args.sender),
-  };
-}
-
-/**
- * The oracle step: read the request block's hash, prove the VRF over
- * keccak256(preSeed, blockHash), check the proof locally, and sign the
- * fulfillment. Call only once the request has its confirmations (blockhash
- * of block n is only readable from block n+1).
- */
-export async function signFulfill(req: VrfRequest): Promise<{ raw: Hex; hash: Hash; output: bigint }> {
-  const block = await publicClient.getBlock({ blockNumber: req.blockNumber });
-  if (!block.hash) throw new Error(`no hash for block ${req.blockNumber}`);
-  const alpha = actualSeed(req.preSeed, block.hash);
-  const { proof, output } = generateProof(oracleSecret, req.preSeed, alpha);
-  if (verifyProof(proof, alpha) !== output) throw new Error('VRF self-check failed');
-  const { raw, hash } = await signTreasuryTx(
-    coordinatorAddress,
-    encodeFunctionData({
-      abi: coordinatorAbi,
-      functionName: 'fulfillRandomWords',
-      args: [
-        proofToAbi(proof),
-        {
-          blockNum: req.blockNumber,
-          callbackGasLimit: req.callbackGasLimit,
-          numWords: req.numWords,
-          sender: req.sender,
-        },
-      ],
-    }),
-  );
-  return { raw, hash, output };
-}
-
-/** Save a block hash to the BlockhashStore before it leaves the 256-block window. */
-export async function signStoreBlockhash(storeAddress: Address, blockNumber: bigint) {
-  return signTreasuryTx(storeAddress, encodeFunctionData({ abi: storeAbi, functionName: 'store', args: [blockNumber] }));
-}
-
-/** The stored hash, or null if the store doesn't have it (getBlockhash reverts). */
-export async function readStoredBlockhash(storeAddress: Address, blockNumber: bigint): Promise<Hex | null> {
-  return publicClient
-    .readContract({ address: storeAddress, abi: storeAbi, functionName: 'getBlockhash', args: [blockNumber] })
-    .catch(() => null);
-}
-
-export function parseFulfillment(receipt: TransactionReceipt, requestId: bigint): VrfFulfillment | null {
-  const fulfilled = parseEventLogs({ abi: coordinatorAbi, eventName: 'RandomWordsFulfilled', logs: receipt.logs }).find(
-    (l) => getAddress(l.address) === coordinatorAddress && l.args.requestId === requestId,
-  );
-  if (!fulfilled) return null;
-  const drawn = parseEventLogs({ abi: roundsAbi, eventName: 'BallDrawn', logs: receipt.logs }).find(
-    (l) => getAddress(l.address) === roundsAddress && l.args.requestId === requestId,
-  );
-  return {
-    success: fulfilled.args.success,
-    outputSeed: fulfilled.args.outputSeed,
-    ball: drawn ? drawn.args.ball : null,
-    randomWord: drawn ? drawn.args.randomWord : null,
-  };
+  return ev ? { requestId: ev.args.requestId, blockNumber: receipt.blockNumber } : null;
 }
 
 /** The on-chain record of a round's draw, read straight from AkipolyRounds. */
@@ -150,13 +55,51 @@ export async function readDraw(gameId: string, roundNumber: number) {
   });
 }
 
+/** Log scans stop this many blocks after the request; an answer later than that is not looked for. */
+const LOG_WINDOW = 5_000n;
+
+async function logRange(fromBlock: bigint) {
+  const head = await publicClient.getBlockNumber();
+  const toBlock = fromBlock + LOG_WINDOW < head ? fromBlock + LOG_WINDOW : head;
+  return { fromBlock, toBlock };
+}
+
+/** The tx in which the Arc VRF delivered this round's ball (for the review's links). */
+export async function findFulfillTx(gameId: string, roundNumber: number, fromBlock: bigint): Promise<Hash | null> {
+  const logs = await publicClient.getContractEvents({
+    address: roundsAddress,
+    abi: roundsAbi,
+    eventName: 'BallDrawn',
+    args: { gameId: gameIdToBytes16(gameId), round: roundNumber },
+    ...(await logRange(fromBlock)),
+  });
+  return logs[0]?.transactionHash ?? null;
+}
+
+/**
+ * Request ids (of `requestIds`) the coordinator answered but whose callback
+ * failed (reverted / out of gas): those draws will never land in drawOf.
+ */
+export async function findFailedCallbacks(requestIds: bigint[], fromBlock: bigint): Promise<Set<bigint>> {
+  if (requestIds.length === 0) return new Set();
+  const logs = await publicClient.getContractEvents({
+    address: coordinatorAddress,
+    abi: coordinatorAbi,
+    eventName: 'RandomWordsFulfilled',
+    args: { requestId: requestIds },
+    ...(await logRange(fromBlock)),
+  });
+  return new Set(logs.filter((l) => l.args.success === false).map((l) => l.args.requestId!));
+}
+
 /**
  * Refuse to run a treasury worker against a mis-wired deployment: wrong
- * requester, coordinator, key or consumer allowlist would strand every round
- * in 'drawing'.
+ * requester, coordinator, key hash, subscription, or AkipolyRounds missing from
+ * the subscription's consumers would strand every round in 'drawing'.
  */
-export async function checkVrfSetup(): Promise<{ mismatches: string[]; unreachable: string | null }> {
+export async function checkVrfSetup(): Promise<{ mismatches: string[]; warnings: string[]; unreachable: string | null }> {
   const problems: string[] = [];
+  const warnings: string[] = [];
   let unreachable: string | null = null;
   // Transport failures (RPC down, timeout) are retryable; anything else (no
   // contract at the address, wrong ABI) means the deployment is wrong.
@@ -169,32 +112,44 @@ export async function checkVrfSetup(): Promise<{ mismatches: string[]; unreachab
       else problems.push(String(err));
       return null;
     });
-  const [requester, coordinator, keyHash, registered, isConsumer] = await Promise.all([
+  const subId = arc.vrf.subscriptionId;
+  const [requester, coordinator, keyHash, roundsSubId, subscription, provingKey] = await Promise.all([
     read(publicClient.readContract({ address: roundsAddress, abi: roundsAbi, functionName: 'requester' })),
     read(publicClient.readContract({ address: roundsAddress, abi: roundsAbi, functionName: 'COORDINATOR' })),
     read(publicClient.readContract({ address: roundsAddress, abi: roundsAbi, functionName: 'keyHash' })),
+    read(publicClient.readContract({ address: roundsAddress, abi: roundsAbi, functionName: 'subId' })),
+    read(
+      publicClient.readContract({
+        address: coordinatorAddress,
+        abi: coordinatorAbi,
+        functionName: 'getSubscription',
+        args: [subId],
+      }),
+    ),
     read(
       publicClient.readContract({
         address: coordinatorAddress,
         abi: coordinatorAbi,
         functionName: 's_provingKeys',
-        args: [oracleKeyHash],
-      }),
-    ),
-    read(
-      publicClient.readContract({
-        address: coordinatorAddress,
-        abi: coordinatorAbi,
-        functionName: 's_consumers',
-        args: [roundsAddress],
+        args: [arc.vrf.keyHash],
       }),
     ),
   ]);
-  if (problems.length || unreachable) return { mismatches: problems, unreachable };
-  if (getAddress(requester!) !== treasuryAddress) problems.push(`AkipolyRounds.requester is ${requester}, not the treasury ${treasuryAddress}`);
-  if (getAddress(coordinator!) !== coordinatorAddress) problems.push(`AkipolyRounds.COORDINATOR is ${coordinator}, env says ${coordinatorAddress}`);
-  if (keyHash !== oracleKeyHash) problems.push(`AkipolyRounds.keyHash ${keyHash} does not match VRF_ORACLE_KEY (${oracleKeyHash})`);
-  if (!registered) problems.push(`VRF_ORACLE_KEY's public key is not registered on the coordinator`);
-  if (!isConsumer) problems.push(`AkipolyRounds is not an allowlisted consumer of the coordinator`);
-  return { mismatches: problems, unreachable: null };
+  if (problems.length || unreachable) return { mismatches: problems, warnings, unreachable };
+
+  if (getAddress(requester!) !== treasuryAddress)
+    problems.push(`AkipolyRounds.requester is ${requester}, not the treasury ${treasuryAddress}`);
+  if (getAddress(coordinator!) !== coordinatorAddress)
+    problems.push(`AkipolyRounds.COORDINATOR is ${coordinator}, expected the Arc VRF coordinator ${coordinatorAddress}`);
+  if (keyHash!.toLowerCase() !== arc.vrf.keyHash.toLowerCase())
+    problems.push(`AkipolyRounds.keyHash ${keyHash} does not match ${arc.vrf.keyHash}`);
+  if (!provingKey![0]) problems.push(`key hash ${arc.vrf.keyHash} is not registered on coordinator ${coordinatorAddress}`);
+  if (roundsSubId !== subId)
+    problems.push(`AkipolyRounds.subId is ${roundsSubId}, VRF_SUBSCRIPTION_ID is ${subId}`);
+  const [, nativeBalance, , , consumers] = subscription!;
+  if (!consumers.some((c) => getAddress(c) === roundsAddress))
+    problems.push(`AkipolyRounds ${roundsAddress} is not a consumer of Arc VRF subscription ${subId} (add it on the Subscriptions page)`);
+  if (nativeBalance < LOW_SUBSCRIPTION_BALANCE)
+    warnings.push(`Arc VRF subscription ${subId} has only ${nativeBalance} wei of USDC left: top it up or draws will fail`);
+  return { mismatches: problems, warnings, unreachable: null };
 }

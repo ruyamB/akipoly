@@ -29,15 +29,13 @@ const schema = z.object({
   ARC_RPC_URL: z.string().url().optional(),
   /** Hot wallet that receives buy-ins/side bets and sends payouts. */
   TREASURY_PRIVATE_KEY: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'TREASURY_PRIVATE_KEY must be 0x + 64 hex'),
-  /** AkipolyRounds: the VRF consumer the treasury calls once per round. */
+  /** AkipolyRounds: the Arc VRF consumer the treasury calls once per round. */
   VRF_ROUNDS_ADDRESS: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'VRF_ROUNDS_ADDRESS must be an address'),
-  /** AkipolyVRFCoordinator: verifies proofs on-chain. */
-  VRF_COORDINATOR_ADDRESS: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'VRF_COORDINATOR_ADDRESS must be an address'),
-  /**
-   * The oracle's VRF secret key (secp256k1). Its public key is registered on the
-   * coordinator. It only signs proofs and never holds funds or pays gas.
-   */
-  VRF_ORACLE_KEY: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'VRF_ORACLE_KEY must be 0x + 64 hex'),
+  /** Arc VRF subscription that pays for draws (https://arcvrf.007575.xyz/subscriptions). */
+  VRF_SUBSCRIPTION_ID: z.string().regex(/^\d{1,78}$/, 'VRF_SUBSCRIPTION_ID must be the numeric subscription id'),
+  /** Override the network's Arc VRF coordinator / key hash (required where none is published). */
+  VRF_COORDINATOR_ADDRESS: z.string().regex(/^0x[0-9a-fA-F]{40}$/, 'VRF_COORDINATOR_ADDRESS must be an address').optional(),
+  VRF_KEY_HASH: z.string().regex(/^0x[0-9a-fA-F]{64}$/, 'VRF_KEY_HASH must be 0x + 64 hex').optional(),
   /** A round still drawing after this long is voided (side bets refunded, nobody out). */
   VRF_DRAW_TIMEOUT_MS: z.coerce.number().int().min(30_000).max(3_600_000).default(300_000),
   /** Run the treasury worker (VRF draws + payouts) in this process. Exactly one instance should. */
@@ -77,8 +75,29 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
+
+// Arc VRF: the network's published coordinator/key hash unless overridden.
+const vrfDefaults = ARC_NETWORKS[env.ARC_NETWORK].vrf;
+const vrfCoordinator = env.VRF_COORDINATOR_ADDRESS ?? vrfDefaults?.coordinator;
+const vrfKeyHash = env.VRF_KEY_HASH ?? vrfDefaults?.keyHash;
+if (!vrfCoordinator || !vrfKeyHash) {
+  // eslint-disable-next-line no-console
+  console.error(
+    `Invalid environment:\n  Arc VRF has no published deployment on ${env.ARC_NETWORK}: set VRF_COORDINATOR_ADDRESS and VRF_KEY_HASH`,
+  );
+  process.exit(1);
+}
+
 export const arc = {
   ...ARC_NETWORKS[env.ARC_NETWORK],
   rpcUrl: env.ARC_RPC_URL ?? ARC_NETWORKS[env.ARC_NETWORK].rpcUrl,
+  vrf: {
+    coordinator: vrfCoordinator as `0x${string}`,
+    keyHash: vrfKeyHash as `0x${string}`,
+    subscriptionId: BigInt(env.VRF_SUBSCRIPTION_ID),
+    // The published explorer only knows the published coordinator's requests.
+    explorerUrl:
+      vrfDefaults && vrfCoordinator.toLowerCase() === vrfDefaults.coordinator.toLowerCase() ? vrfDefaults.explorerUrl : null,
+  },
 };
 export type Env = typeof env;
